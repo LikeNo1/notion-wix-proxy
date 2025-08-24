@@ -1,16 +1,11 @@
 // /api/events.js
-// Vercel Serverless Function (Node, ESM). Nutzt NUR die Wix Member ID (kein Musician Key).
-// Environment Variables (in Vercel > Project > Settings > Environment Variables):
-// - NOTION_TOKEN       -> Dein Notion API Token (ntn_...)
-// - NOTION_DB_ID       -> DB-ID "Booking Process"
-// - ARTISTS_DB_ID      -> DB-ID "Artists"
-// - ALLOWED_ORIGINS    -> Deine Wix-Domain(s), z.B. "https://www.deinedomain.de,https://deinname.wixsite.com"
+// Vercel Serverless Function – nutzt WixOwnerID statt "Wix Member ID"
 
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-const DB_BP  = process.env.NOTION_DB_ID;     // Booking Process
-const DB_ART = process.env.ARTISTS_DB_ID;    // Artists
+const DB_BP  = process.env.NOTION_DB_ID;     // Booking Process DB
+const DB_ART = process.env.ARTISTS_DB_ID;    // Artists DB
 
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
@@ -34,52 +29,49 @@ export default async function handler(req, res) {
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // Query-Parameter vom Frontend
     const {
       musicianId,   // Wix Member ID der eingeloggten Person (Pflicht)
-      cursor,       // Notion start_cursor für Pagination
-      q,            // Suchbegriff (optional)
-      sort,         // "gig_asc" | "gig_desc" (optional)
-      availability, // "Yes" | "No" | "Other" | "all" (optional)
-      status        // einer Deiner Status-Werte | "all" (optional)
+      cursor,
+      q,
+      sort,
+      availability,
+      status
     } = req.query;
 
     if (!musicianId) {
       return res.status(400).json({ error: "Missing musicianId" });
     }
 
-    // 1) Artist in Notion über die Wix Member ID finden
+    // 1) Artist in Notion über WixOwnerID finden
     const artistResult = await notion.databases.query({
       database_id: DB_ART,
       page_size: 1,
       filter: {
-        property: "Wix Member ID",
+        property: "WixOwnerID",   // <<<<< HIER angepasster Property-Name
         rich_text: { equals: String(musicianId) }
       }
     });
 
     if (!artistResult.results?.length) {
-      return res.status(404).json({ error: "Artist not found for given Wix Member ID" });
+      return res.status(404).json({ error: "Artist not found for given WixOwnerID" });
     }
     const artistPage = artistResult.results[0];
 
-    // 2) Basis-Filter: OwnerID (Relation) enthält diesen Artist
+    // 2) Filter für Booking Process
     const filters = [{
       property: "OwnerID",
       relation: { contains: artistPage.id }
     }];
 
-    // 3) Suche (Gig Title + Summary)
     if (q && String(q).trim()) {
       filters.push({
         or: [
-          { property: "Gig",     title:     { contains: String(q).trim() } },
+          { property: "Gig", title: { contains: String(q).trim() } },
           { property: "Summary", rich_text: { contains: String(q).trim() } }
         ]
       });
     }
 
-    // 4) Filter Availability (Artist availability)
     if (availability && availability !== "all") {
       filters.push({
         property: "Artist availability",
@@ -87,7 +79,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // 5) Filter Status
     if (status && status !== "all") {
       filters.push({
         property: "Status",
@@ -95,12 +86,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // 6) Sortierung
     const sorts = [];
-    if (sort === "gig_asc")  sorts.push({ property: "Gig", direction: "ascending"  });
+    if (sort === "gig_asc")  sorts.push({ property: "Gig", direction: "ascending" });
     if (sort === "gig_desc") sorts.push({ property: "Gig", direction: "descending" });
 
-    // 7) Notion-Abfrage (30er Pagination)
     const response = await notion.databases.query({
       database_id: DB_BP,
       page_size: 30,
@@ -109,7 +98,6 @@ export default async function handler(req, res) {
       sorts: sorts.length ? sorts : undefined
     });
 
-    // 8) Felder fürs Frontend mappen
     const results = response.results.map(page => {
       const p = page.properties || {};
       return {
@@ -122,7 +110,6 @@ export default async function handler(req, res) {
       };
     });
 
-    // 9) Antwort an Frontend
     res.json({
       results,
       nextCursor: response.next_cursor || null,
