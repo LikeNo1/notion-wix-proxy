@@ -1,4 +1,3 @@
-// /api/events.js — Relation bevorzugt, Rollup-Fallback; Summary-Fallback aus Events-Relation
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -21,7 +20,7 @@ function bad(res, msg, details) { return res.status(400).json({ error: msg, deta
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = rich => Array.isArray(rich) ? rich.map(n => n?.plain_text || "").join("").trim() : "";
 
-// Rollup → menschenlesbarer String
+// ---- helpers to read Notion values ----
 function fromRollup(r) {
   if (!r || !r.type) return "";
   if (r.type === "array" && Array.isArray(r.array)) {
@@ -59,20 +58,18 @@ function extractSummaryFromProp(prop) {
   if (prop.type === "title")     return plain(prop.title);
   return "";
 }
-
 function extractAvailability(prop) {
   if (!prop) return "";
-  if (prop.type === "select")   return prop.select?.name || "";
-  if (prop.type === "rollup")   return fromRollup(prop.rollup);
-  if (prop.type === "rich_text")return plain(prop.rich_text);
-  if (prop.type === "formula")  {
+  if (prop.type === "select")    return prop.select?.name || "";
+  if (prop.type === "rollup")    return fromRollup(prop.rollup);
+  if (prop.type === "rich_text") return plain(prop.rich_text);
+  if (prop.type === "formula") {
     const f = prop.formula;
     if (f?.type === "string") return f.string || "";
   }
   return "";
 }
 
-// Artist via WixOwnerID/Wix Owner ID/Wix Member ID
 async function findArtistByWixId(musicianId) {
   const idStr = String(musicianId).trim();
   const propNames = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
@@ -89,30 +86,27 @@ async function findArtistByWixId(musicianId) {
     try {
       const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
       if (r.results?.length) return r.results[0];
-    } catch (_) {}
+    } catch { /* ignore */ }
   }
   return null;
 }
 
-// Booking-DB Schema analysieren
+// ---- Booking schema: owner relation/rollup + alle anderen relations einsammeln ----
 async function getBookingSchemaInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
 
-  // Owner (Artist/Owner) Relation/ Rollup
   const relations = [];
   const rollups   = [];
   for (const [name, def] of Object.entries(db.properties || {})) {
     if (def.type === "relation") relations.push({ name, type: "relation" });
     if (def.type === "rollup")   rollups.push({ name, type: "rollup" });
   }
-  const pickBy = (arr, re) => arr.find(p => re.test(p.name)) || null;
+  const pickOwnerRel  = relations.find(p => /owner|artist/i.test(p.name)) || null;
+  const pickOwnerRoll = rollups.find(p => /owner|artist/i.test(p.name)) || null;
+  const owner = pickOwnerRel || pickOwnerRoll || relations[0] || rollups[0] || { name: null, type: null };
 
-  const ownerRel  = pickBy(relations, /(owner|artist)/i) || relations[0] || null;
-  const ownerRoll = pickBy(rollups,   /(owner|artist)/i) || rollups[0]   || null;
-  const owner     = ownerRel || ownerRoll || { name: null, type: null };
-
-  // Versuch, eine Events-Relation zu finden (Event/Events/Gig)
-  const eventRel  = pickBy(relations.filter(r => !/(owner|artist)/i.test(r.name)), /(event|events|gig)/i) || null;
+  // alle Relations außer Owner – Kandidaten für Event-/Gig-Relation
+  const otherRelations = relations.filter(r => r.name !== owner.name);
 
   const typed = (n) => db.properties?.[n] ? { name: n, type: db.properties[n].type } : { name: null, type: null };
   const status       = typed("Status");
@@ -123,28 +117,24 @@ async function getBookingSchemaInfo() {
         : { name: null, type: null });
   const summary      = typed("Summary");
 
-  return { owner, eventRel, status, availability, summary };
+  return { owner, otherRelations, status, availability, summary };
 }
 
-// Summary direkt aus Events-Seite (Relation) holen – falls nötig
-async function fetchEventSummaryFromRelated(page, eventRelName) {
-  if (!eventRelName) return "";
-  const rel = P(page, eventRelName);
-  const firstId = rel?.relation?.[0]?.id;
-  if (!firstId) return "";
-  try {
-    const ev = await notion.pages.retrieve({ page_id: firstId });
-    // Bevorzugt „Summary“, sonst heuristisch aus Titel+RichText bauen
-    const propSummary = ev.properties?.["Summary"];
-    let s = extractSummaryFromProp(propSummary);
-    if (!s) {
-      const evTitle = ev.properties?.["Name"] || ev.properties?.["Title"] || ev.properties?.["Gig"];
-      s = extractSummaryFromProp(evTitle);
-    }
-    return s || "";
-  } catch {
-    return "";
+// ---- versucht nacheinander alle Relations (außer Owner) und holt deren Summary ----
+async function tryFetchSummaryFromAnyRelated(page, otherRelations) {
+  for (const rel of otherRelations) {
+    const rp = P(page, rel.name);
+    const firstId = rp?.relation?.[0]?.id;
+    if (!firstId) continue;
+    try {
+      const ev = await notion.pages.retrieve({ page_id: firstId });
+      const s = extractSummaryFromProp(ev.properties?.["Summary"]);
+      if (s && s.replace(/\s+/g, "").length > 10) {
+        return { summary: s, viaRelation: rel.name };
+      }
+    } catch { /* ignore and continue */ }
   }
+  return { summary: "", viaRelation: null };
 }
 
 async function mapPageAsync(page, info) {
@@ -162,27 +152,30 @@ async function mapPageAsync(page, info) {
     pStat?.type === "status" ? (pStat.status?.name || "") :
     pStat?.type === "select" ? (pStat.select?.name || "") : "";
 
-  // 1) Summary aus Booking-Page
+  // 1) Booking-Summary lesen
   let summary = extractSummaryFromProp(pSum);
 
-  // 2) Fallback: aus Events-Relation holen, wenn Booking-Formula zu „mager“ ist
+  // 2) Fallback: aus beliebiger verknüpfter Nicht-Owner-Relation holen
   const looksEmpty =
     !summary ||
     summary === "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:   \n📃 Beschreibung und Vibe:" ||
     summary.replace(/\s+/g, "").length < 10;
 
-  if (looksEmpty) {
-    const deep = await fetchEventSummaryFromRelated(page, info.eventRel?.name);
-    if (deep) summary = deep;
+  let viaRelation = null;
+  if (looksEmpty && info.otherRelations?.length) {
+    const got = await tryFetchSummaryFromAnyRelated(page, info.otherRelations);
+    if (got.summary) {
+      summary = got.summary;
+      viaRelation = got.viaRelation;
+    }
   }
 
   const availability = extractAvailability(pAvail);
-
   const comment =
     pComm?.type === "rich_text" ? plain(pComm.rich_text) :
     pComm?.type === "title" ? plain(pComm.title) : "";
 
-  return { id: page.id, gig, summary, status, availability, comment };
+  return { id: page.id, gig, summary, status, availability, comment, _summaryVia: viaRelation || "" };
 }
 
 export default async function handler(req, res) {
@@ -209,21 +202,17 @@ export default async function handler(req, res) {
     } = req.query || {};
     if (!musicianId) return bad(res, "Missing musicianId");
 
-    // 1) Artist
     const artist = await findArtistByWixId(musicianId);
     if (!artist) return res.status(404).json({ error: "Artist not found by Wix member id", musicianId });
 
-    // 2) Booking-DB Schema
     const info = await getBookingSchemaInfo();
     if (!info.owner.name || !info.owner.type) return bad(res, "No owner relation/rollup found in Booking DB", info);
 
-    // 3) Owner-Filter
     const ownerFilter =
       info.owner.type === "relation"
         ? { property: info.owner.name, relation: { contains: artist.id } }
         : { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
 
-    // 4) weitere Filter
     const andFilters = [];
     const wantPotential = String(includePotential).trim() === "1";
     if (!wantPotential && info.status.name) {
@@ -273,7 +262,6 @@ export default async function handler(req, res) {
     else if (sort === "gig_desc")sorts.push({ property: "Gig", direction: "descending" });
     else                         sorts.push({ timestamp: "last_edited_time", direction: "descending" });
 
-    // 5) Query
     const r = await notion.databases.query({
       database_id: DB_BOOK,
       page_size: 30,
@@ -282,15 +270,23 @@ export default async function handler(req, res) {
       filter: { and: [ownerFilter, ...andFilters] }
     });
 
-    // 6) Mapping (inkl. Deep-Fetch der Summary)
-    const results = await Promise.all((r.results || []).map(p => mapPageAsync(p, info)));
+    const mapped = await Promise.all((r.results || []).map(p => mapPageAsync(p, info)));
 
     const payload = {
-      results,
+      results: mapped,
       nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more
     };
-    if (String(debug).trim() === "1") payload.debug = { artistId: artist.id, ...info, ownerFilter, andFilters };
+    if (String(debug).trim() === "1") {
+      payload.debug = {
+        artistId: artist.id,
+        owner: info.owner,
+        otherRelations: info.otherRelations?.map(x => x.name),
+        status: info.status,
+        availability: info.availability,
+        summary: info.summary
+      };
+    }
 
     res.json(payload);
   } catch (e) {
