@@ -1,9 +1,9 @@
-// /api/events.js – robust: Relation/Rollup + Formel-Summary + "Potential" ausfiltern + klare Fehler
+// /api/events.js – Events für eingeloggte Artists, "Potential" wird serverseitig ausgeschlossen
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-const DB_BP  = process.env.NOTION_DB_ID;   // Booking Process DB
-const DB_ART = process.env.ARTISTS_DB_ID;  // Artists DB
+const DB_BOOK = process.env.BOOKING_DB_ID; // Booking Process DB (Events)
+const DB_ART  = process.env.ARTISTS_DB_ID; // Artists DB
 
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
@@ -21,23 +21,71 @@ function bad(res, msg, details) {
   return res.status(400).json({ error: msg, details });
 }
 
-// Summary kann Formel (string/rich_text), rich_text oder title sein
-function readSummary(prop) {
-  if (!prop) return "";
-  if (prop.type === "formula") {
-    const f = prop.formula || {};
-    if (f.type === "string" && typeof f.string === "string") return f.string || "";
-    if (f.type === "rich_text" && Array.isArray(f.rich_text)) {
-      return f.rich_text.map(t => t?.plain_text || "").join("");
-    }
-    if (f.type === "number" && typeof f.number === "number") return String(f.number);
-    if (f.type === "boolean" && typeof f.boolean === "boolean") return String(f.boolean);
-    if (f.type === "date" && f.date?.start) return f.date.start;
-    return "";
-  }
-  if (prop.type === "rich_text") return (prop.rich_text || []).map(t => t?.plain_text || "").join("");
-  if (prop.type === "title")     return (prop.title || []).map(t => t?.plain_text || "").join("");
+// ---- helpers to read properties safely ----
+function plain(rich) {
+  if (Array.isArray(rich)) return rich.map(n => n?.plain_text || "").join("").trim();
   return "";
+}
+function getProp(page, key) { return page?.properties?.[key]; }
+
+function mapPage(page) {
+  const pGig   = getProp(page, "Gig");
+  const pStat  = getProp(page, "Status");
+  const pSum   = getProp(page, "Summary");               // kann Formula ODER rich_text sein
+  const pAvail = getProp(page, "Artist availability");   // Select/Text/Formula
+  const pComm  = getProp(page, "Artist comment");        // rich_text
+
+  // Gig (Titel)
+  const gig =
+    pGig?.type === "title" ? plain(pGig.title) :
+    pGig?.type === "rich_text" ? plain(pGig.rich_text) :
+    "";
+
+  // Status (status/select)
+  const status =
+    pStat?.type === "status" ? (pStat.status?.name || "") :
+    pStat?.type === "select" ? (pStat.select?.name || "") :
+    "";
+
+  // Summary (Formula bevorzugen, sonst rich_text/title)
+  let summary = "";
+  if (pSum?.type === "formula") {
+    const f = pSum.formula;
+    if (f?.type === "string") summary = f.string || "";
+    else if (f?.type === "number" && typeof f.number === "number") summary = String(f.number);
+    else if (f?.type === "boolean") summary = f.boolean ? "true" : "false";
+    else if (f?.type === "date") summary = f.date?.start || "";
+  } else if (pSum?.type === "rich_text") {
+    summary = plain(pSum.rich_text);
+  } else if (pSum?.type === "title") {
+    summary = plain(pSum.title);
+  }
+
+  // Availability (Select bevorzugen, sonst Text/Formula)
+  let availability = "";
+  if (pAvail?.type === "select") {
+    availability = pAvail.select?.name || "";
+  } else if (pAvail?.type === "rich_text") {
+    availability = plain(pAvail.rich_text);
+  } else if (pAvail?.type === "formula") {
+    const f = pAvail.formula;
+    if (f?.type === "string") availability = f.string || "";
+  }
+
+  // Comment
+  const comment =
+    pComm?.type === "rich_text" ? plain(pComm.rich_text) :
+    pComm?.type === "title" ? plain(pComm.title) :
+    "";
+
+  return {
+    id: page.id,
+    gig,
+    summary,
+    status,
+    availability,
+    comment
+  };
 }
 
 export default async function handler(req, res) {
@@ -45,26 +93,32 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
-  const { musicianId, cursor, q, sort, availability, status } = req.query;
-
-  // Grundchecks
   const missing = [];
   if (!process.env.NOTION_TOKEN) missing.push("NOTION_TOKEN");
-  if (!DB_BP) missing.push("NOTION_DB_ID");
+  if (!DB_BOOK) missing.push("BOOKING_DB_ID");
   if (!DB_ART) missing.push("ARTISTS_DB_ID");
-  if (!musicianId) missing.push("musicianId");
   if (missing.length) return bad(res, "Missing required values", missing);
 
   try {
-    // 1) Artist finden – mehrere mögliche Property-Namen
-    const artistIdFilters = [
+    const {
+      musicianId = "",
+      cursor = null,
+      q = "",
+      sort = "gig_asc",
+      availability = "all",
+      status = "all"
+    } = req.query || {};
+
+    if (!musicianId) return bad(res, "Missing musicianId");
+
+    // 1) Artist finden (über WixOwnerID / Wix Owner ID / Wix Member ID)
+    const idFilters = [
       { property: "WixOwnerID",     rich_text: { equals: String(musicianId) } },
       { property: "Wix Owner ID",   rich_text: { equals: String(musicianId) } },
       { property: "Wix Member ID",  rich_text: { equals: String(musicianId) } }
     ];
-
     let artistPage = null, artistsQueryError = null;
-    for (const f of artistIdFilters) {
+    for (const f of idFilters) {
       try {
         const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
         if (r.results?.length) { artistPage = r.results[0]; break; }
@@ -81,101 +135,105 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2) Zusätzliche Filter (Suche, Availability, Status)
-    const extraFilters = [];
+    // 2) Query-Filter für Booking DB bauen
+    const andFilters = [];
 
-    if (q && String(q).trim()) {
-      const query = String(q).trim();
-      extraFilters.push({
+    // 2a) Ownership via Relation ODER Rollup (any.relation.contains)
+    //    - Falls 'OwnerID' Relation ist → relation contains artistPage.id
+    //    - Falls 'OwnerID' Rollup ist → any.relation contains artistPage.id
+    const ownerRelationFilter = {
+      or: [
+        { property: "OwnerID", relation: { contains: artistPage.id } },
+        { property: "Owner ID", relation: { contains: artistPage.id } }
+      ]
+    };
+    // Für Rollup-Variante (Notion-API: rollup.any.relation.contains)
+    const ownerRollupFilter = {
+      or: [
+        { property: "OwnerID", rollup: { any: { relation: { contains: artistPage.id } } } },
+        { property: "Owner ID", rollup: { any: { relation: { contains: artistPage.id } } } }
+      ]
+    };
+    andFilters.push({ or: [ ownerRelationFilter, ownerRollupFilter ] });
+
+    // 2b) Status "Potential" strikt ausschließen
+    andFilters.push({
+      or: [
+        { property: "Status", status: { does_not_equal: "Potential" } },
+        { property: "Status", select: { does_not_equal: "Potential" } }
+      ]
+    });
+
+    // 2c) Optional: status (nur erlaubte, niemals "all")
+    const statusNorm = String(status).trim();
+    if (statusNorm && statusNorm.toLowerCase() !== "all") {
+      andFilters.push({
         or: [
-          { property: "Gig", title: { contains: query } },
-          { property: "Summary", formula: { string: { contains: query } } }, // Formel-String
-          { property: "Summary", rich_text: { contains: query } }            // Fallback: rich_text
+          { property: "Status", status: { equals: statusNorm } },
+          { property: "Status", select: { equals: statusNorm } }
         ]
       });
     }
 
-    if (availability && availability !== "all") {
-      extraFilters.push({ property: "Artist availability", select: { equals: String(availability) } });
-    }
-    if (status && status !== "all") {
-      extraFilters.push({ property: "Status", select: { equals: String(status) } });
-    }
-
-    const sorts = [];
-    if (sort === "gig_asc")  sorts.push({ property: "Gig", direction: "ascending" });
-    if (sort === "gig_desc") sorts.push({ property: "Gig", direction: "descending" });
-
-    // 3) Booking-Query: Relation-Prop ODER Rollup-Prop auf OwnerID/Owner ID
-    const relationPropNames = ["OwnerID", "Owner ID"];
-    let response = null, lastErr = null;
-
-    // 3a) Relation versuchen
-    for (const prop of relationPropNames) {
-      try {
-        const compound = { and: [{ property: prop, relation: { contains: artistPage.id } }, ...extraFilters] };
-        response = await notion.databases.query({
-          database_id: DB_BP,
-          page_size: 30,
-          start_cursor: cursor || undefined,
-          filter: compound,
-          sorts: sorts.length ? sorts : undefined
+    // 2d) Optional: availability
+    const availNorm = String(availability || "").trim().toLowerCase();
+    if (availNorm && availNorm !== "all") {
+      const availName = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
+      if (availName) {
+        andFilters.push({
+          or: [
+            { property: "Artist availability", select: { equals: availName } },
+            { property: "Artist availability", rich_text: { equals: availName } },
+            { property: "Artist availability", formula: { string: { equals: availName } } }
+          ]
         });
-        break;
-      } catch (e) {
-        lastErr = e?.body || e?.message || String(e);
-        response = null;
       }
     }
 
-    // 3b) Rollup-Fallback
-    if (!response) {
-      for (const prop of relationPropNames) {
-        try {
-          const compound = { and: [{
-            property: prop,
-            rollup: { any: { relation: { contains: artistPage.id } } }
-          }, ...extraFilters] };
-          response = await notion.databases.query({
-            database_id: DB_BP,
-            page_size: 30,
-            start_cursor: cursor || undefined,
-            filter: compound,
-            sorts: sorts.length ? sorts : undefined
-          });
-          break;
-        } catch (e) {
-          lastErr = e?.body || e?.message || String(e);
-          response = null;
-        }
-      }
+    // 2e) Optional: Suche im Gig-Titel
+    const queryNorm = String(q || "").trim();
+    if (queryNorm) {
+      andFilters.push({ property: "Gig", title: { contains: queryNorm } });
     }
 
-    if (!response) {
-      return res.status(400).json({
-        error: "Booking Process query failed",
-        hint: "Stelle sicher, dass der Artist-Link in Booking Process eine Relation ('OwnerID'/'Owner ID') oder ein Rollup dieser Relation ist. Prüfe außerdem: Gig, Summary, Status, Artist availability, Artist comment.",
-        lastErr
-      });
+    const filterObj = andFilters.length ? { and: andFilters } : undefined;
+
+    // 3) Sortierung
+    const sorts = [];
+    if (sort === "gig_asc") {
+      sorts.push({ property: "Gig", direction: "ascending" });
+    } else if (sort === "gig_desc") {
+      sorts.push({ property: "Gig", direction: "descending" });
+    } else {
+      // Fallback: zuletzt geändert
+      sorts.push({ timestamp: "last_edited_time", direction: "descending" });
     }
 
-    // 4) Projektion der Felder
-    let results = response.results.map(page => {
-      const p = page.properties || {};
-      const gig = (p.Gig?.title || []).map(t => t?.plain_text || "").join("");
-      const summary = readSummary(p.Summary);
-      const statusName = p.Status?.select?.name || "";
-      const avail = p["Artist availability"]?.select?.name || "";
-      const comment = (p["Artist comment"]?.rich_text || []).map(t => t?.plain_text || "").join("");
-      return { id: page.id, gig, summary, status: statusName, availability: avail, comment };
+    // 4) Query ausführen
+    const pageSize = 30;
+    const params = {
+      database_id: DB_BOOK,
+      page_size: pageSize,
+      sorts
+    };
+    if (filterObj) params.filter = filterObj;
+    if (cursor) params.start_cursor = String(cursor);
+
+    const r = await notion.databases.query(params);
+
+    // 5) Mappen
+    const results = (r.results || []).map(mapPage);
+    const nextCursor = r.has_more ? r.next_cursor : null;
+
+    // 6) Antwort
+    res.json({
+      results,
+      nextCursor,
+      hasMore: !!r.has_more
     });
 
-    // 5) 🚫 "Potential" serverseitig ausfiltern
-    results = results.filter(ev => ev.status !== "Potential");
-
-    res.json({ results, nextCursor: response.next_cursor || null, hasMore: Boolean(response.has_more) });
   } catch (e) {
-    console.error("UNCAUGHT /api/events:", e?.body || e?.message || e);
+    console.error("@events error:", e?.body || e?.message || e);
     res.status(500).json({ error: "Server error" });
   }
 }
