@@ -45,33 +45,36 @@ function textFrom(prop) {
     case "rollup": {
       const r = prop.rollup || {};
       if (r.type === "array" && Array.isArray(r.array)) {
+        // Versuche, aus Array-Elementen Text zu gewinnen
         return r.array.map(v => textFrom(v)).filter(Boolean).join(" ").trim();
       }
       if (r.type === "number") return (r.number ?? "") + "";
       if (r.type === "date")   return r.date?.start || "";
+      if (r.type === "string") return r.string || "";
       return "";
     }
     default: return "";
   }
 }
-function readAny(ev, names) {
+function readAnyFromPage(page, names) {
   for (const n of names) {
-    const p = ev.properties?.[n];
-    const v = textFrom(p);
+    const v = textFrom(P(page, n));
     if (v) return v;
   }
   return "";
 }
-async function buildSummaryFromEventPage(eventPage) {
-  if (!eventPage) return "";
-  const date     = readAny(eventPage, [ process.env.EVENT_PROP_DATE || "Date + Time", "Date", "Datetime", "Date/Time" ]);
-  const country  = readAny(eventPage, [ "Country" ]);
-  const location = readAny(eventPage, [ "Location", "City" ]);
-  const website  = readAny(eventPage, [ "Website", "Web", "URL" ]);
-  const instagram= readAny(eventPage, [ "Instagram", "IG" ]);
-  const facebook = readAny(eventPage, [ "Facebook", "FB" ]);
-  const shortD   = readAny(eventPage, [ "Short description", "Short Description" ]);
-  const vibe     = readAny(eventPage, [ "Vibe/Notes", "Vibe", "Notes" ]);
+
+// ---------- Summary Builder (Booking-Seite, aus Rollups) ----------
+function buildSummaryFromBookingPage(page) {
+  // Du hast die exakten Property-Namen genannt – die stehen hier zuerst.
+  const date     = readAnyFromPage(page, [ "Date + Time", "Date", "Datetime", "Date/Time" ]);
+  const country  = readAnyFromPage(page, [ "Country" ]);
+  const location = readAnyFromPage(page, [ "Location", "City" ]);
+  const website  = readAnyFromPage(page, [ "Website", "Web", "URL" ]);
+  const instagram= readAnyFromPage(page, [ "Instagram", "IG" ]);
+  const facebook = readAnyFromPage(page, [ "Facebook", "FB" ]);
+  const shortD   = readAnyFromPage(page, [ "Short description", "Short Description" ]);
+  const vibe     = readAnyFromPage(page, [ "Vibe/Notes", "Vibe", "Notes" ]);
 
   const lines = [];
   lines.push(`📅 Datum/Zeit: ${date || "noch zu terminieren"}`);
@@ -82,6 +85,7 @@ async function buildSummaryFromEventPage(eventPage) {
   if (vibe)   lines.push(vibe);
   return lines.join("\n").trim();
 }
+
 function looksEmptySummary(s) {
   if (!s) return true;
   const template = "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:   \n📃 Beschreibung und Vibe:";
@@ -127,17 +131,16 @@ async function getBookingInfo() {
     }
   }
 
-  // alle Relations für späteres Debug
-  const relations = Object.entries(db.properties || {})
-    .filter(([n, d]) => d?.type === "relation")
-    .map(([n, d]) => ({ name: n, type: d.type }));
+  const statusProp = db.properties?.["Status"]
+    ? { name: "Status", type: db.properties["Status"].type }
+    : { name: null, type: null };
 
-  const statusProp = db.properties?.["Status"] ? { name: "Status", type: db.properties["Status"].type } : { name: null, type: null };
-  const availName = db.properties?.["Artist availability"] ? "Artist availability"
-                   : (db.properties?.["Availability artist"] ? "Availability artist" : null);
+  const availName = db.properties?.["Artist availability"]
+    ? "Artist availability"
+    : (db.properties?.["Availability artist"] ? "Availability artist" : null);
   const availType = availName ? db.properties[availName].type : null;
 
-  return { db, ownerName, ownerType, statusProp, availName, availType, relations };
+  return { db, ownerName, ownerType, statusProp, availName, availType };
 }
 
 export default async function handler(req, res) {
@@ -210,11 +213,6 @@ export default async function handler(req, res) {
     });
 
     const results = [];
-    const debugItems = [];
-
-    // Liste aller Relations (außer Owner) aus der DB-Definition
-    const relationNames = info.relations.map(r => r.name).filter(n => n !== info.ownerName);
-
     for (const page of (r.results || [])) {
       const gigProp   = P(page, "Gig");
       const statusProp= P(page, "Status");
@@ -230,24 +228,11 @@ export default async function handler(req, res) {
         statusProp?.type === "status" ? (statusProp.status?.name || "") :
         statusProp?.type === "select" ? (statusProp.select?.name || "") : "";
 
+      // 1) Formel nutzen
       let summary = textFrom(sumProp);
-      let usedRelation = "";
-
-      // 👉 Fallback: pro Seite über ALLE Relation-Properties iterieren (außer Owner),
-      // erste Relation mit mind. 1 verknüpfter Seite verwenden
+      // 2) Falls leer/Template → direkt aus ROLLUPS der Booking-Seite bauen
       if (looksEmptySummary(summary)) {
-        for (const relName of relationNames) {
-          const relProp = P(page, relName);
-          const count = relProp?.relation?.length || 0;
-          const firstId = relProp?.relation?.[0]?.id;
-          if (count > 0 && firstId) {
-            try {
-              const ev = await notion.pages.retrieve({ page_id: firstId });
-              const built = await buildSummaryFromEventPage(ev);
-              if (built) { summary = built; usedRelation = relName; break; }
-            } catch {}
-          }
-        }
+        summary = buildSummaryFromBookingPage(page);
       }
 
       const availability = textFrom(availProp);
@@ -255,29 +240,14 @@ export default async function handler(req, res) {
         commProp?.type === "rich_text" ? plain(commProp.rich_text) :
         commProp?.type === "title" ? plain(commProp.title) : "";
 
-      results.push({ id: page.id, gig, summary, status: statusTxt, availability, comment, _summaryVia: usedRelation });
-
-      if (String(debug) === "1") {
-        const relOnPage = {};
-        for (const rn of relationNames) relOnPage[rn] = P(page, rn)?.relation?.length || 0;
-        debugItems.push({ id: page.id, usedRelation, relationsOnPage: relOnPage, summaryLen: (summary||"").length });
-      }
+      results.push({ id: page.id, gig, summary, status: statusTxt, availability, comment });
     }
 
-    const payload = {
+    res.json({
       results,
       nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more
-    };
-    if (String(debug) === "1") {
-      payload.debug = {
-        ownerName: info.ownerName,
-        ownerType: info.ownerType,
-        relationNames,
-        items: debugItems
-      };
-    }
-    res.json(payload);
+    });
   } catch (e) {
     res.status(500).json({ error: "Server error", details: e.body || e.message || String(e) });
   }
