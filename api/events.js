@@ -1,4 +1,4 @@
-// /api/events.js – Relation/Rollup-Fallbacks + Formel-Summary + klare Fehler
+// /api/events.js – robust: Relation/Rollup + Formel-Summary + "Potential" ausfiltern + klare Fehler
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -21,20 +21,22 @@ function bad(res, msg, details) {
   return res.status(400).json({ error: msg, details });
 }
 
-// Hilfsleser: Summary kann formula/string, rich_text oder title sein
+// Summary kann Formel (string/rich_text), rich_text oder title sein
 function readSummary(prop) {
   if (!prop) return "";
   if (prop.type === "formula") {
     const f = prop.formula || {};
-    if (f.type === "string") return f.string || "";
-    // andere Formeltypen (number/boolean/date) defensiv in String wandeln
+    if (f.type === "string" && typeof f.string === "string") return f.string || "";
+    if (f.type === "rich_text" && Array.isArray(f.rich_text)) {
+      return f.rich_text.map(t => t?.plain_text || "").join("");
+    }
     if (f.type === "number" && typeof f.number === "number") return String(f.number);
     if (f.type === "boolean" && typeof f.boolean === "boolean") return String(f.boolean);
     if (f.type === "date" && f.date?.start) return f.date.start;
     return "";
   }
-  if (prop.type === "rich_text") return (prop.rich_text || []).map(t => t.plain_text || "").join("");
-  if (prop.type === "title")     return (prop.title     || []).map(t => t.plain_text || "").join("");
+  if (prop.type === "rich_text") return (prop.rich_text || []).map(t => t?.plain_text || "").join("");
+  if (prop.type === "title")     return (prop.title || []).map(t => t?.plain_text || "").join("");
   return "";
 }
 
@@ -45,7 +47,7 @@ export default async function handler(req, res) {
 
   const { musicianId, cursor, q, sort, availability, status } = req.query;
 
-  // ---- Grundchecks
+  // Grundchecks
   const missing = [];
   if (!process.env.NOTION_TOKEN) missing.push("NOTION_TOKEN");
   if (!DB_BP) missing.push("NOTION_DB_ID");
@@ -54,7 +56,7 @@ export default async function handler(req, res) {
   if (missing.length) return bad(res, "Missing required values", missing);
 
   try {
-    // ---- 1) Artist finden – mehrere mögliche Property-Namen unterstützen
+    // 1) Artist finden – mehrere mögliche Property-Namen
     const artistIdFilters = [
       { property: "WixOwnerID",     rich_text: { equals: String(musicianId) } },
       { property: "Wix Owner ID",   rich_text: { equals: String(musicianId) } },
@@ -73,25 +75,22 @@ export default async function handler(req, res) {
     if (!artistPage) {
       return res.status(404).json({
         error: "Artist not found by Wix member id",
-        hint: "Check Artists DB id and that WixOwnerID (or Wix Owner ID / Wix Member ID) holds the exact Wix id.",
+        hint: "Prüfe ARTISTS_DB_ID und dass 'WixOwnerID' (oder 'Wix Owner ID' / 'Wix Member ID') exakt die Wix-ID enthält.",
         musicianId,
         artistsQueryError
       });
     }
 
-    // ---- 2) Filter (Suche + Availability + Status)
+    // 2) Zusätzliche Filter (Suche, Availability, Status)
     const extraFilters = [];
 
     if (q && String(q).trim()) {
-      // Suche in Gig (title) ODER Summary (formula.string ODER rich_text)
       const query = String(q).trim();
       extraFilters.push({
         or: [
           { property: "Gig", title: { contains: query } },
-          // Formel-Summary
-          { property: "Summary", formula: { string: { contains: query } } },
-          // Fallback, falls Summary doch rich_text ist
-          { property: "Summary", rich_text: { contains: query } }
+          { property: "Summary", formula: { string: { contains: query } } }, // Formel-String
+          { property: "Summary", rich_text: { contains: query } }            // Fallback: rich_text
         ]
       });
     }
@@ -107,7 +106,7 @@ export default async function handler(req, res) {
     if (sort === "gig_asc")  sorts.push({ property: "Gig", direction: "ascending" });
     if (sort === "gig_desc") sorts.push({ property: "Gig", direction: "descending" });
 
-    // ---- 3) Booking-Query: Relation-Prop ODER Rollup-Prop unterstützen
+    // 3) Booking-Query: Relation-Prop ODER Rollup-Prop auf OwnerID/Owner ID
     const relationPropNames = ["OwnerID", "Owner ID"];
     let response = null, lastErr = null;
 
@@ -128,6 +127,7 @@ export default async function handler(req, res) {
         response = null;
       }
     }
+
     // 3b) Rollup-Fallback
     if (!response) {
       for (const prop of relationPropNames) {
@@ -154,21 +154,24 @@ export default async function handler(req, res) {
     if (!response) {
       return res.status(400).json({
         error: "Booking Process query failed",
-        hint: "Ensure the Artist link is a Relation ('OwnerID'/'Owner ID') or a Rollup of that relation. Also verify property names: Gig, Summary, Status, Artist availability, Artist comment.",
+        hint: "Stelle sicher, dass der Artist-Link in Booking Process eine Relation ('OwnerID'/'Owner ID') oder ein Rollup dieser Relation ist. Prüfe außerdem: Gig, Summary, Status, Artist availability, Artist comment.",
         lastErr
       });
     }
 
-    // ---- 4) Projektion der Felder
-    const results = response.results.map(page => {
+    // 4) Projektion der Felder
+    let results = response.results.map(page => {
       const p = page.properties || {};
-      const gig = (p.Gig?.title || []).map(t => t.plain_text || "").join("");
+      const gig = (p.Gig?.title || []).map(t => t?.plain_text || "").join("");
       const summary = readSummary(p.Summary);
       const statusName = p.Status?.select?.name || "";
       const avail = p["Artist availability"]?.select?.name || "";
-      const comment = (p["Artist comment"]?.rich_text || []).map(t => t.plain_text || "").join("");
+      const comment = (p["Artist comment"]?.rich_text || []).map(t => t?.plain_text || "").join("");
       return { id: page.id, gig, summary, status: statusName, availability: avail, comment };
     });
+
+    // 5) 🚫 "Potential" serverseitig ausfiltern
+    results = results.filter(ev => ev.status !== "Potential");
 
     res.json({ results, nextCursor: response.next_cursor || null, hasMore: Boolean(response.has_more) });
   } catch (e) {
