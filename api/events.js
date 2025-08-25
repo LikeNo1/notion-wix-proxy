@@ -228,12 +228,26 @@ export default async function handler(req, res) {
         statusProp?.type === "status" ? (statusProp.status?.name || "") :
         statusProp?.type === "select" ? (statusProp.select?.name || "") : "";
 
-      // 1) Formel nutzen
-      let summary = textFrom(sumProp);
-      // 2) Falls leer/Template → direkt aus ROLLUPS der Booking-Seite bauen
-      if (looksEmptySummary(summary)) {
-        summary = buildSummaryFromBookingPage(page);
-      }
+      // Summary immer aus den Rollups direkt bauen
+const date     = textFrom(P(page, "Date + Time"));
+const country  = textFrom(P(page, "Country"));
+const location = textFrom(P(page, "Location"));
+const website  = textFrom(P(page, "Website"));
+const instagram= textFrom(P(page, "Instagram"));
+const facebook = textFrom(P(page, "Facebook"));
+const shortD   = textFrom(P(page, "Short description"));
+const vibe     = textFrom(P(page, "Vibe/Notes"));
+
+let summaryLines = [];
+summaryLines.push(`📅 Datum/Zeit: ${date || "noch zu terminieren"}`);
+summaryLines.push(`🗺️ Location: ${[country, location].filter(Boolean).join("/") || "/"}`);
+summaryLines.push(`🔗 Link: ${[website, instagram, facebook].filter(Boolean).join(" ")}`.trim());
+summaryLines.push("📃 Beschreibung und Vibe:");
+if (shortD) summaryLines.push(shortD);
+if (vibe)   summaryLines.push(vibe);
+
+const summary = summaryLines.join("\n").trim();
+
 
       const availability = textFrom(availProp);
       const comment =
