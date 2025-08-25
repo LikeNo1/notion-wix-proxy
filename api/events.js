@@ -1,9 +1,9 @@
-// /api/events.js – robustere Artist-Suche, "Potential" ausgeschlossen, Formel-Summary
+// /api/events.js – robuste Artist-Suche, Potential ausgeschlossen, saubere Fehlerdetails
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-const DB_BOOK = process.env.BOOKING_DB_ID; // Booking Process DB (Events)
-const DB_ART  = process.env.ARTISTS_DB_ID; // Artists DB
+const DB_BOOK = process.env.BOOKING_DB_ID;
+const DB_ART  = process.env.ARTISTS_DB_ID;
 
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
@@ -21,7 +21,6 @@ function bad(res, msg, details) {
   return res.status(400).json({ error: msg, details });
 }
 
-// ---- helpers ----
 function plain(rich) {
   if (Array.isArray(rich)) return rich.map(n => n?.plain_text || "").join("").trim();
   return "";
@@ -73,14 +72,10 @@ function mapPage(page) {
   return { id: page.id, gig, summary, status, availability, comment };
 }
 
-// ---- robust: Artist via WixOwnerID / Wix Owner ID / Wix Member ID finden ----
+// Artist via WixOwnerID / Wix Owner ID / Wix Member ID suchen (versch. Typen)
 async function findArtistByWixId(musicianId) {
   const idStr = String(musicianId).trim();
-
-  // Kandidaten für Property-Namen in Artists-DB
   const propNames = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
-
-  // Wir probieren mehrere Filter-Varianten (rich_text equals/contains, title equals/contains, formula.string contains)
   const filters = [];
   for (const p of propNames) {
     filters.push({ property: p, rich_text: { equals: idStr } });
@@ -90,18 +85,53 @@ async function findArtistByWixId(musicianId) {
     filters.push({ property: p, formula:   { string: { equals: idStr } } });
     filters.push({ property: p, formula:   { string: { contains: idStr } } });
   }
-
-  // Wir versuchen nacheinander; beim ersten Treffer geben wir die Seite zurück
   for (const f of filters) {
     try {
       const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
       if (r.results?.length) return r.results[0];
-    } catch (e) {
-      // wir ignorieren einzelne Filterfehler (z. B. falscher Property-Typ) und probieren weiter
-      continue;
-    }
+    } catch (_) { /* einzelne Filter ignorieren */ }
   }
   return null;
+}
+
+// Query: einmal mit Relation, bei Fehler/0 Treffern nochmal mit Rollup
+async function queryBookingsWithOwnership(artistId, filterBase, sorts, cursor) {
+  // 1) Relation-Variante
+  const relOr = {
+    or: [
+      { property: "OwnerID", relation: { contains: artistId } },
+      { property: "Owner ID", relation: { contains: artistId } }
+    ]
+  };
+  try {
+    const r1 = await notion.databases.query({
+      database_id: DB_BOOK,
+      page_size: 30,
+      sorts,
+      filter: filterBase ? { and: [relOr, ...filterBase] } : relOr,
+      start_cursor: cursor || undefined
+    });
+    if (r1.results?.length || r1.has_more) return r1;
+  } catch (e) {
+    // Wenn Notion meckert (z. B. falscher Typ), probieren wir Rollup
+    // console.warn('Relation query failed, trying rollup', e.body || e.message);
+  }
+
+  // 2) Rollup-Variante
+  const rollOr = {
+    or: [
+      { property: "OwnerID", rollup: { any: { relation: { contains: artistId } } } },
+      { property: "Owner ID", rollup: { any: { relation: { contains: artistId } } } }
+    ]
+  };
+  const r2 = await notion.databases.query({
+    database_id: DB_BOOK,
+    page_size: 30,
+    sorts,
+    filter: filterBase ? { and: [rollOr, ...filterBase] } : rollOr,
+    start_cursor: cursor || undefined
+  });
+  return r2;
 }
 
 export default async function handler(req, res) {
@@ -112,7 +142,7 @@ export default async function handler(req, res) {
   const missing = [];
   if (!process.env.NOTION_TOKEN) missing.push("NOTION_TOKEN");
   if (!DB_BOOK) missing.push("BOOKING_DB_ID");
-  if (!DB_ART) missing.push("ARTISTS_DB_ID");
+  if (!DB_ART)  missing.push("ARTISTS_DB_ID");
   if (missing.length) return bad(res, "Missing required values", missing);
 
   try {
@@ -127,34 +157,20 @@ export default async function handler(req, res) {
 
     if (!musicianId) return bad(res, "Missing musicianId");
 
-    // 1) Artist finden (robust)
-    const artistPage = await findArtistByWixId(musicianId);
-    if (!artistPage) {
+    // 1) Artist finden
+    const artist = await findArtistByWixId(musicianId);
+    if (!artist) {
       return res.status(404).json({
         error: "Artist not found by Wix member id",
-        hint: "Prüfe in der Artists-DB die Property (z. B. 'WixOwnerID') und dass die Member-ID exakt (ohne Leerzeichen) drinsteht."
+        hint: "Prüfe Artists-DB Property (z. B. 'WixOwnerID') und den exakten Wert.",
+        musicianId
       });
     }
 
-    // 2) Query-Filter für Booking DB
+    // 2) Gemeinsame Filter (Potential raus etc.)
     const andFilters = [];
 
-    // Ownership via Relation ODER Rollup
-    const ownerRelationFilter = {
-      or: [
-        { property: "OwnerID", relation: { contains: artistPage.id } },
-        { property: "Owner ID", relation: { contains: artistPage.id } }
-      ]
-    };
-    const ownerRollupFilter = {
-      or: [
-        { property: "OwnerID", rollup: { any: { relation: { contains: artistPage.id } } } },
-        { property: "Owner ID", rollup: { any: { relation: { contains: artistPage.id } } } }
-      ]
-    };
-    andFilters.push({ or: [ ownerRelationFilter, ownerRollupFilter ] });
-
-    // Status "Potential" strikt ausschließen
+    // Potential ausschließen
     andFilters.push({
       or: [
         { property: "Status", status: { does_not_equal: "Potential" } },
@@ -162,7 +178,7 @@ export default async function handler(req, res) {
       ]
     });
 
-    // Optional: Status (niemals "all")
+    // optional Status
     const statusNorm = String(status).trim();
     if (statusNorm && statusNorm.toLowerCase() !== "all") {
       andFilters.push({
@@ -173,22 +189,25 @@ export default async function handler(req, res) {
       });
     }
 
-    // Optional: Availability
+    // optional Availability
     const availNorm = String(availability || "").trim().toLowerCase();
     if (availNorm && availNorm !== "all") {
-      const availName = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
+      const availName =
+        availNorm === "yes"  ? "Yes"  :
+        availNorm === "no"   ? "No"   :
+        availNorm === "other"? "Other": "";
       if (availName) {
         andFilters.push({
           or: [
-            { property: "Artist availability", select: { equals: availName } },
-            { property: "Artist availability", rich_text: { equals: availName } },
+            { property: "Artist availability", select:  { equals: availName } },
+            { property: "Artist availability", rich_text:{ equals: availName } },
             { property: "Artist availability", formula: { string: { equals: availName } } }
           ]
         });
       }
     }
 
-    // Optional: Suche (Gig-Titel & Summary-Formel)
+    // optional Suche (Titel + Formula-Summary)
     const queryNorm = String(q || "").trim();
     if (queryNorm) {
       andFilters.push({
@@ -200,30 +219,20 @@ export default async function handler(req, res) {
       });
     }
 
-    const filterObj = andFilters.length ? { and: andFilters } : undefined;
-
     // Sortierung
     const sorts = [];
     if (sort === "gig_asc")      sorts.push({ property: "Gig", direction: "ascending" });
     else if (sort === "gig_desc")sorts.push({ property: "Gig", direction: "descending" });
     else                         sorts.push({ timestamp: "last_edited_time", direction: "descending" });
 
-    // Query ausführen
-    const params = {
-      database_id: DB_BOOK,
-      page_size: 30,
-      sorts
-    };
-    if (filterObj) params.filter = filterObj;
-    if (cursor)    params.start_cursor = String(cursor);
+    // 3) Query: Relation oder Rollup
+    const r = await queryBookingsWithOwnership(artist.id, andFilters, sorts, cursor);
 
-    const r = await notion.databases.query(params);
-
-    // Mappen
+    // 4) Antwort
     const results = (r.results || []).map(mapPage);
-    res.json({ results, nextCursor: r.has_more ? r.next_cursor : null, hasMore: !!r.has_more });
+    return res.json({ results, nextCursor: r.has_more ? r.next_cursor : null, hasMore: !!r.has_more });
   } catch (e) {
-    console.error("@events error:", e?.body || e?.message || e);
-    res.status(500).json({ error: "Server error" });
+    // hier liefern wir echte Details für die Diagnose zurück
+    return res.status(500).json({ error: "Server error", details: e.body || e.message || String(e) });
   }
 }
