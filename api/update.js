@@ -1,4 +1,4 @@
-// /api/update.js – Availability/Comment speichern + Status "Artist replied" setzen
+// /api/update.js – Availability/Comment speichern + Status "Sent to LikeNo1" setzen
 import { Client } from '@notionhq/client';
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -30,58 +30,46 @@ export default async function handler(req, res) {
     const { bookingId, availability, comment, musicianId } = req.body || {};
     if (!bookingId) return res.status(400).json({ error: 'bookingId missing' });
 
-    // 1) Notion page lesen (Status ermitteln)
-    const page = await notion.pages.retrieve({ page_id: bookingId }).catch(() => null);
+    // Seite holen (um Property-Typen zu erkennen)
+    const page = await notion.pages.retrieve({ page_id: bookingId });
 
-    // 2) Eigenschaften bauen
-    const properties = {};
+    const props = {};
 
-    // Artist availability (Select/Text)
+    // Availability (Select bevorzugt, sonst RichText – hier Select)
     if (typeof availability === 'string') {
-      // wenn Select-Property:
-      properties['Artist availability'] = { select: availability ? { name: availability } : null };
-      // Fallback (falls in Deiner DB Rich Text sein sollte):
-      // properties['Artist availability'] = { rich_text: availability ? [{ type:'text', text:{ content: availability } }] : [] };
+      props['Artist availability'] = availability
+        ? { select: { name: availability } }
+        : { select: null };
     }
 
-    // Artist comment (Rich Text)
+    // Comment (Rich Text)
     if (typeof comment === 'string') {
-      properties['Artist comment'] = {
-        rich_text: comment ? [{ type: 'text', text: { content: comment } }] : []
-      };
+      const text = String(comment || '').slice(0, 1900);
+      props['Artist comment'] = text ? { rich_text: [{ type: 'text', text: { content: text } }] } : { rich_text: [] };
     }
 
-    // 3) Status auf "Artist replied" setzen (wenn Status-Property existiert)
-    //    final / rote Stati lassen wir unangetastet.
-    const finalStatus = new Set(['Cancelled/Declined', 'Completed', 'Post-show', 'Confirmed/In progress']);
-    let shouldTouchStatus = true;
-
+    // Status -> "Sent to LikeNo1" setzen (sofern Status-Property existiert)
     if (page?.properties?.Status) {
       const p = page.properties.Status;
-      const current =
-        p.type === 'status' ? (p.status?.name || '') :
-        p.type === 'select' ? (p.select?.name || '') : '';
-
-      if (finalStatus.has(current)) {
-        shouldTouchStatus = false;
+      // Wenn Property vom Typ "status"
+      if (p.type === 'status') {
+        props['Status'] = { status: { name: 'Sent to LikeNo1' } };
+      } else if (p.type === 'select') {
+        props['Status'] = { select: { name: 'Sent to LikeNo1' } };
       }
-      if (shouldTouchStatus) {
-        properties['Status'] = (p.type === 'status')
-          ? { status: { name: 'Artist replied' } }
-          : { select: { name: 'Artist replied' } };
-      }
+      // Falls Du manche Endstati NIE überschreiben willst, kannst Du hier eine Sperrliste einbauen.
     }
 
-    // 4) Update ausführen
-    await notion.pages.update({
-      page_id: bookingId,
-      properties
-    });
+    if (!Object.keys(props).length) {
+      return res.status(400).json({ error: 'No properties to update' });
+    }
 
-    // Optional: Kommentar an die Notion-Page hängen
+    await notion.pages.update({ page_id: bookingId, properties: props });
+
+    // Optional: Kommentarnotiz anheften
     // await notion.comments.create({
     //   parent: { page_id: bookingId },
-    //   rich_text: [{ type: 'text', text: { content: `Artist updated via Wix (${musicianId || 'unknown'})` } }]
+    //   rich_text: [{ type: 'text', text: { content: `Updated via Wix by ${musicianId || 'unknown'}` } }]
     // });
 
     res.json({ ok: true });
