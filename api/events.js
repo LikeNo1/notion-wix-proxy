@@ -1,4 +1,4 @@
-// /api/events.js — bevorzugt RELATION (Artist/Owner), fallback ROLLUP; typgenaue Filter
+// /api/events.js — robust: Relation bevorzugen, Rollup-Fallback; Summary/Availability inkl. Rollup-Unterstützung
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -21,39 +21,77 @@ function bad(res, msg, details) { return res.status(400).json({ error: msg, deta
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = rich => Array.isArray(rich) ? rich.map(n => n?.plain_text || "").join("").trim() : "";
 
+// ---- Rollup-Reader: fasst Strings aus „Show original“ sauber zusammen ----
+function fromRollup(r) {
+  if (!r || !r.type) return "";
+  // Notion liefert bei „Show original“ meist array mit Items (rich_text/title/url/date/…)
+  if (r.type === "array" && Array.isArray(r.array)) {
+    const parts = r.array.map(v => {
+      switch (v?.type) {
+        case "rich_text":   return plain(v.rich_text);
+        case "title":       return plain(v.title);
+        case "url":         return v.url || "";
+        case "date":        return v.date?.start || "";
+        case "email":       return v.email || "";
+        case "phone_number":return v.phone_number || "";
+        case "number":      return (v.number ?? "") + "";
+        case "people":      return (v.people?.name || "");
+        default:            return "";
+      }
+    }).filter(Boolean);
+    return parts.join("\n").trim();
+  }
+  // manchmal „unsupported“/„incomplete“ → leer
+  if (r.type === "incomplete") return "";
+  // number/date/etc. Aggregationen
+  if (r.type === "number") return (r.number ?? "") + "";
+  if (r.type === "date")   return r.date?.start || "";
+  return "";
+}
+
 function mapPage(page) {
   const pGig   = P(page, "Gig");
   const pStat  = P(page, "Status");
-  const pSum   = P(page, "Summary");
-  const pAvail = P(page, "Artist availability") || P(page, "Availability artist");
+  const pSum   = P(page, "Summary"); // kann formula/rich_text/title/rollup sein
+  const pAvail = P(page, "Artist availability") || P(page, "Availability artist"); // deine Umbenennung
   const pComm  = P(page, "Artist comment");
 
+  // Gig
   const gig =
     pGig?.type === "title" ? plain(pGig.title) :
     pGig?.type === "rich_text" ? plain(pGig.rich_text) : "";
 
+  // Status
   const status =
     pStat?.type === "status" ? (pStat.status?.name || "") :
     pStat?.type === "select" ? (pStat.select?.name || "") : "";
 
+  // Summary: Reihenfolge → Rollup > Formula > RichText > Title
   let summary = "";
-  if (pSum?.type === "formula") {
+  if (pSum?.type === "rollup") {
+    summary = fromRollup(pSum.rollup);
+  }
+  if (!summary && pSum?.type === "formula") {
     const f = pSum.formula;
-    if (f?.type === "string") summary = f.string || "";
-    else if (f?.type === "number")  summary = String(f.number);
-    else if (f?.type === "boolean") summary = f.boolean ? "true" : "false";
-    else if (f?.type === "date")    summary = f.date?.start || "";
-  } else if (pSum?.type === "rich_text") summary = plain(pSum.rich_text);
-  else if (pSum?.type === "title")        summary = plain(pSum.title);
+    if (f?.type === "string")      summary = f.string || "";
+    else if (f?.type === "number") summary = String(f.number);
+    else if (f?.type === "boolean")summary = f.boolean ? "true" : "false";
+    else if (f?.type === "date")   summary = f.date?.start || "";
+  }
+  if (!summary && pSum?.type === "rich_text") summary = plain(pSum.rich_text);
+  if (!summary && pSum?.type === "title")     summary = plain(pSum.title);
 
+  // Availability: Select bevorzugen, sonst Rollup (Show original), dann RichText/Formula
   let availability = "";
   if (pAvail?.type === "select") availability = pAvail.select?.name || "";
-  else if (pAvail?.type === "rich_text") availability = plain(pAvail.rich_text);
-  else if (pAvail?.type === "formula") {
+  if (!availability && pAvail?.type === "rollup") availability = fromRollup(pAvail.rollup);
+  if (!availability && pAvail?.type === "rich_text") availability = plain(pAvail.rich_text);
+  if (!availability && pAvail?.type === "formula") {
     const f = pAvail.formula;
     if (f?.type === "string") availability = f.string || "";
   }
 
+  // Comment
   const comment =
     pComm?.type === "rich_text" ? plain(pComm.rich_text) :
     pComm?.type === "title" ? plain(pComm.title) : "";
@@ -61,7 +99,7 @@ function mapPage(page) {
   return { id: page.id, gig, summary, status, availability, comment };
 }
 
-// Artist via WixOwnerID / Wix Owner ID / Wix Member ID
+// ---- Artist in Artists-DB via WixOwnerID/Wix Owner ID/Wix Member ID ----
 async function findArtistByWixId(musicianId) {
   const idStr = String(musicianId).trim();
   const propNames = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
@@ -83,36 +121,31 @@ async function findArtistByWixId(musicianId) {
   return null;
 }
 
-// Booking-DB-Schema analysieren → bevorzugt eine RELATION mit "owner"/"artist" im Namen, sonst ROLLUP
+// ---- Booking-DB Schema: bevorzugt RELATION (Artist/Owner), sonst ROLLUP ----
 async function getBookingSchemaInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
 
-  // alle Relations und Rollups einsammeln
   const relations = [];
   const rollups   = [];
   for (const [name, def] of Object.entries(db.properties || {})) {
     if (def.type === "relation") relations.push({ name, type: "relation" });
     if (def.type === "rollup")   rollups.push({ name, type: "rollup" });
   }
-  // heuristik: bevorzugt "owner"/"artist" im Namen
-  const pickByName = (arr) =>
-    arr.find(p => /owner|artist/i.test(p.name)) || arr[0] || null;
+  const pickByName = (arr) => arr.find(p => /owner|artist/i.test(p.name)) || arr[0] || null;
 
-  const ownerRel = pickByName(relations);
-  const ownerRoll= pickByName(rollups);
+  const ownerRel  = pickByName(relations);
+  const ownerRoll = pickByName(rollups);
+  const owner     = ownerRel || ownerRoll || { name: null, type: null };
 
-  // Status / Availability / Summary wie gehabt
-  const prop = n => db.properties?.[n] ? { name: n, type: db.properties[n].type } : { name: null, type: null };
-  const status       = prop("Status");
+  const typed = (n) => db.properties?.[n] ? { name: n, type: db.properties[n].type } : { name: null, type: null };
+  const status       = typed("Status");
   const availability = db.properties?.["Artist availability"]
     ? { name: "Artist availability", type: db.properties["Artist availability"].type }
     : (db.properties?.["Availability artist"]
         ? { name: "Availability artist", type: db.properties["Availability artist"].type }
         : { name: null, type: null });
-  const summary      = prop("Summary");
+  const summary      = typed("Summary");
 
-  // Owner: Relation bevorzugen, sonst Rollup
-  const owner = ownerRel || ownerRoll || { name: null, type: null };
   return { owner, status, availability, summary };
 }
 
@@ -146,16 +179,13 @@ export default async function handler(req, res) {
     const info = await getBookingSchemaInfo();
     if (!info.owner.name || !info.owner.type) return bad(res, "No owner relation/rollup found in Booking DB", info);
 
-    // Owner-Filter (Relation bevorzugt)
-    let ownerFilter;
-    if (info.owner.type === "relation") {
-      ownerFilter = { property: info.owner.name, relation: { contains: artist.id } };
-    } else {
-      ownerFilter = { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
-    }
+    // Ownership-Filter (Relation bevorzugt)
+    const ownerFilter =
+      info.owner.type === "relation"
+        ? { property: info.owner.name, relation: { contains: artist.id } }
+        : { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
 
     const andFilters = [];
-
     const wantPotential = String(includePotential).trim() === "1";
     if (!wantPotential && info.status.name) {
       if (info.status.type === "status") andFilters.push({ property: info.status.name, status: { does_not_equal: "Potential" } });
@@ -172,9 +202,14 @@ export default async function handler(req, res) {
     if (availNorm && availNorm !== "all" && info.availability.name) {
       const availName = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
       if (availName) {
-        if (info.availability.type === "select") andFilters.push({ property: info.availability.name, select: { equals: availName } });
-        else if (info.availability.type === "rich_text") andFilters.push({ property: info.availability.name, rich_text: { equals: availName } });
-        else if (info.availability.type === "formula") andFilters.push({ property: info.availability.name, formula: { string: { equals: availName } } });
+        if (info.availability.type === "select")
+          andFilters.push({ property: info.availability.name, select: { equals: availName } });
+        else if (info.availability.type === "rollup")
+          andFilters.push({ property: info.availability.name, rollup: { any: { rich_text: { equals: availName } } } });
+        else if (info.availability.type === "rich_text")
+          andFilters.push({ property: info.availability.name, rich_text: { equals: availName } });
+        else if (info.availability.type === "formula")
+          andFilters.push({ property: info.availability.name, formula: { string: { equals: availName } } });
       }
     }
 
@@ -182,9 +217,14 @@ export default async function handler(req, res) {
     if (qNorm) {
       const or = [{ property: "Gig", title: { contains: qNorm } }];
       if (info.summary.name) {
-        if (info.summary.type === "formula") or.push({ property: info.summary.name, formula: { string: { contains: qNorm } } });
-        else if (info.summary.type === "rich_text") or.push({ property: info.summary.name, rich_text: { contains: qNorm } });
-        else if (info.summary.type === "title") or.push({ property: info.summary.name, title: { contains: qNorm } });
+        if (info.summary.type === "rollup")
+          or.push({ property: info.summary.name, rollup: { any: { rich_text: { contains: qNorm } } } });
+        else if (info.summary.type === "formula")
+          or.push({ property: info.summary.name, formula: { string: { contains: qNorm } } });
+        else if (info.summary.type === "rich_text")
+          or.push({ property: info.summary.name, rich_text: { contains: qNorm } });
+        else if (info.summary.type === "title")
+          or.push({ property: info.summary.name, title: { contains: qNorm } });
       }
       andFilters.push({ or });
     }
