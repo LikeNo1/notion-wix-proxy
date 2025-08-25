@@ -1,4 +1,4 @@
-// /api/events.js — robust: Relation bevorzugen, Rollup-Fallback; Summary/Availability inkl. Rollup-Unterstützung
+// /api/events.js — Relation bevorzugt, Rollup-Fallback; Summary-Fallback aus Events-Relation
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -21,85 +21,58 @@ function bad(res, msg, details) { return res.status(400).json({ error: msg, deta
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = rich => Array.isArray(rich) ? rich.map(n => n?.plain_text || "").join("").trim() : "";
 
-// ---- Rollup-Reader: fasst Strings aus „Show original“ sauber zusammen ----
+// Rollup → menschenlesbarer String
 function fromRollup(r) {
   if (!r || !r.type) return "";
-  // Notion liefert bei „Show original“ meist array mit Items (rich_text/title/url/date/…)
   if (r.type === "array" && Array.isArray(r.array)) {
     const parts = r.array.map(v => {
       switch (v?.type) {
-        case "rich_text":   return plain(v.rich_text);
-        case "title":       return plain(v.title);
-        case "url":         return v.url || "";
-        case "date":        return v.date?.start || "";
-        case "email":       return v.email || "";
-        case "phone_number":return v.phone_number || "";
-        case "number":      return (v.number ?? "") + "";
-        case "people":      return (v.people?.name || "");
-        default:            return "";
+        case "rich_text":    return plain(v.rich_text);
+        case "title":        return plain(v.title);
+        case "url":          return v.url || "";
+        case "date":         return v.date?.start || "";
+        case "email":        return v.email || "";
+        case "phone_number": return v.phone_number || "";
+        case "number":       return (v.number ?? "") + "";
+        default:             return "";
       }
     }).filter(Boolean);
     return parts.join("\n").trim();
   }
-  // manchmal „unsupported“/„incomplete“ → leer
-  if (r.type === "incomplete") return "";
-  // number/date/etc. Aggregationen
   if (r.type === "number") return (r.number ?? "") + "";
   if (r.type === "date")   return r.date?.start || "";
   return "";
 }
 
-function mapPage(page) {
-  const pGig   = P(page, "Gig");
-  const pStat  = P(page, "Status");
-  const pSum   = P(page, "Summary"); // kann formula/rich_text/title/rollup sein
-  const pAvail = P(page, "Artist availability") || P(page, "Availability artist"); // deine Umbenennung
-  const pComm  = P(page, "Artist comment");
-
-  // Gig
-  const gig =
-    pGig?.type === "title" ? plain(pGig.title) :
-    pGig?.type === "rich_text" ? plain(pGig.rich_text) : "";
-
-  // Status
-  const status =
-    pStat?.type === "status" ? (pStat.status?.name || "") :
-    pStat?.type === "select" ? (pStat.select?.name || "") : "";
-
-  // Summary: Reihenfolge → Rollup > Formula > RichText > Title
-  let summary = "";
-  if (pSum?.type === "rollup") {
-    summary = fromRollup(pSum.rollup);
+function extractSummaryFromProp(prop) {
+  if (!prop) return "";
+  if (prop.type === "rollup")  return fromRollup(prop.rollup);
+  if (prop.type === "formula") {
+    const f = prop.formula;
+    if (f?.type === "string")   return f.string || "";
+    if (f?.type === "number")   return String(f.number);
+    if (f?.type === "boolean")  return f.boolean ? "true" : "false";
+    if (f?.type === "date")     return f.date?.start || "";
+    return "";
   }
-  if (!summary && pSum?.type === "formula") {
-    const f = pSum.formula;
-    if (f?.type === "string")      summary = f.string || "";
-    else if (f?.type === "number") summary = String(f.number);
-    else if (f?.type === "boolean")summary = f.boolean ? "true" : "false";
-    else if (f?.type === "date")   summary = f.date?.start || "";
-  }
-  if (!summary && pSum?.type === "rich_text") summary = plain(pSum.rich_text);
-  if (!summary && pSum?.type === "title")     summary = plain(pSum.title);
-
-  // Availability: Select bevorzugen, sonst Rollup (Show original), dann RichText/Formula
-  let availability = "";
-  if (pAvail?.type === "select") availability = pAvail.select?.name || "";
-  if (!availability && pAvail?.type === "rollup") availability = fromRollup(pAvail.rollup);
-  if (!availability && pAvail?.type === "rich_text") availability = plain(pAvail.rich_text);
-  if (!availability && pAvail?.type === "formula") {
-    const f = pAvail.formula;
-    if (f?.type === "string") availability = f.string || "";
-  }
-
-  // Comment
-  const comment =
-    pComm?.type === "rich_text" ? plain(pComm.rich_text) :
-    pComm?.type === "title" ? plain(pComm.title) : "";
-
-  return { id: page.id, gig, summary, status, availability, comment };
+  if (prop.type === "rich_text") return plain(prop.rich_text);
+  if (prop.type === "title")     return plain(prop.title);
+  return "";
 }
 
-// ---- Artist in Artists-DB via WixOwnerID/Wix Owner ID/Wix Member ID ----
+function extractAvailability(prop) {
+  if (!prop) return "";
+  if (prop.type === "select")   return prop.select?.name || "";
+  if (prop.type === "rollup")   return fromRollup(prop.rollup);
+  if (prop.type === "rich_text")return plain(prop.rich_text);
+  if (prop.type === "formula")  {
+    const f = prop.formula;
+    if (f?.type === "string") return f.string || "";
+  }
+  return "";
+}
+
+// Artist via WixOwnerID/Wix Owner ID/Wix Member ID
 async function findArtistByWixId(musicianId) {
   const idStr = String(musicianId).trim();
   const propNames = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
@@ -121,21 +94,25 @@ async function findArtistByWixId(musicianId) {
   return null;
 }
 
-// ---- Booking-DB Schema: bevorzugt RELATION (Artist/Owner), sonst ROLLUP ----
+// Booking-DB Schema analysieren
 async function getBookingSchemaInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
 
+  // Owner (Artist/Owner) Relation/ Rollup
   const relations = [];
   const rollups   = [];
   for (const [name, def] of Object.entries(db.properties || {})) {
     if (def.type === "relation") relations.push({ name, type: "relation" });
     if (def.type === "rollup")   rollups.push({ name, type: "rollup" });
   }
-  const pickByName = (arr) => arr.find(p => /owner|artist/i.test(p.name)) || arr[0] || null;
+  const pickBy = (arr, re) => arr.find(p => re.test(p.name)) || null;
 
-  const ownerRel  = pickByName(relations);
-  const ownerRoll = pickByName(rollups);
+  const ownerRel  = pickBy(relations, /(owner|artist)/i) || relations[0] || null;
+  const ownerRoll = pickBy(rollups,   /(owner|artist)/i) || rollups[0]   || null;
   const owner     = ownerRel || ownerRoll || { name: null, type: null };
+
+  // Versuch, eine Events-Relation zu finden (Event/Events/Gig)
+  const eventRel  = pickBy(relations.filter(r => !/(owner|artist)/i.test(r.name)), /(event|events|gig)/i) || null;
 
   const typed = (n) => db.properties?.[n] ? { name: n, type: db.properties[n].type } : { name: null, type: null };
   const status       = typed("Status");
@@ -146,7 +123,66 @@ async function getBookingSchemaInfo() {
         : { name: null, type: null });
   const summary      = typed("Summary");
 
-  return { owner, status, availability, summary };
+  return { owner, eventRel, status, availability, summary };
+}
+
+// Summary direkt aus Events-Seite (Relation) holen – falls nötig
+async function fetchEventSummaryFromRelated(page, eventRelName) {
+  if (!eventRelName) return "";
+  const rel = P(page, eventRelName);
+  const firstId = rel?.relation?.[0]?.id;
+  if (!firstId) return "";
+  try {
+    const ev = await notion.pages.retrieve({ page_id: firstId });
+    // Bevorzugt „Summary“, sonst heuristisch aus Titel+RichText bauen
+    const propSummary = ev.properties?.["Summary"];
+    let s = extractSummaryFromProp(propSummary);
+    if (!s) {
+      const evTitle = ev.properties?.["Name"] || ev.properties?.["Title"] || ev.properties?.["Gig"];
+      s = extractSummaryFromProp(evTitle);
+    }
+    return s || "";
+  } catch {
+    return "";
+  }
+}
+
+async function mapPageAsync(page, info) {
+  const pGig   = P(page, "Gig");
+  const pStat  = P(page, "Status");
+  const pSum   = P(page, "Summary");
+  const pAvail = P(page, "Artist availability") || P(page, "Availability artist");
+  const pComm  = P(page, "Artist comment");
+
+  const gig =
+    pGig?.type === "title" ? plain(pGig.title) :
+    pGig?.type === "rich_text" ? plain(pGig.rich_text) : "";
+
+  const status =
+    pStat?.type === "status" ? (pStat.status?.name || "") :
+    pStat?.type === "select" ? (pStat.select?.name || "") : "";
+
+  // 1) Summary aus Booking-Page
+  let summary = extractSummaryFromProp(pSum);
+
+  // 2) Fallback: aus Events-Relation holen, wenn Booking-Formula zu „mager“ ist
+  const looksEmpty =
+    !summary ||
+    summary === "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:   \n📃 Beschreibung und Vibe:" ||
+    summary.replace(/\s+/g, "").length < 10;
+
+  if (looksEmpty) {
+    const deep = await fetchEventSummaryFromRelated(page, info.eventRel?.name);
+    if (deep) summary = deep;
+  }
+
+  const availability = extractAvailability(pAvail);
+
+  const comment =
+    pComm?.type === "rich_text" ? plain(pComm.rich_text) :
+    pComm?.type === "title" ? plain(pComm.title) : "";
+
+  return { id: page.id, gig, summary, status, availability, comment };
 }
 
 export default async function handler(req, res) {
@@ -173,18 +209,21 @@ export default async function handler(req, res) {
     } = req.query || {};
     if (!musicianId) return bad(res, "Missing musicianId");
 
+    // 1) Artist
     const artist = await findArtistByWixId(musicianId);
     if (!artist) return res.status(404).json({ error: "Artist not found by Wix member id", musicianId });
 
+    // 2) Booking-DB Schema
     const info = await getBookingSchemaInfo();
     if (!info.owner.name || !info.owner.type) return bad(res, "No owner relation/rollup found in Booking DB", info);
 
-    // Ownership-Filter (Relation bevorzugt)
+    // 3) Owner-Filter
     const ownerFilter =
       info.owner.type === "relation"
         ? { property: info.owner.name, relation: { contains: artist.id } }
         : { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
 
+    // 4) weitere Filter
     const andFilters = [];
     const wantPotential = String(includePotential).trim() === "1";
     if (!wantPotential && info.status.name) {
@@ -234,6 +273,7 @@ export default async function handler(req, res) {
     else if (sort === "gig_desc")sorts.push({ property: "Gig", direction: "descending" });
     else                         sorts.push({ timestamp: "last_edited_time", direction: "descending" });
 
+    // 5) Query
     const r = await notion.databases.query({
       database_id: DB_BOOK,
       page_size: 30,
@@ -242,7 +282,9 @@ export default async function handler(req, res) {
       filter: { and: [ownerFilter, ...andFilters] }
     });
 
-    const results = (r.results || []).map(mapPage);
+    // 6) Mapping (inkl. Deep-Fetch der Summary)
+    const results = await Promise.all((r.results || []).map(p => mapPageAsync(p, info)));
+
     const payload = {
       results,
       nextCursor: r.has_more ? r.next_cursor : null,
