@@ -4,11 +4,6 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 const DB_ART  = process.env.ARTISTS_DB_ID;
 
-// 👉 Falls Deine Event-Relation anders heißt, hier ergänzen/ändern:
-const FORCE_EVENT_RELATIONS = [
-  "Events", "Event", "Gig", "Linked Event", "Linked Events"
-];
-
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -132,25 +127,17 @@ async function getBookingInfo() {
     }
   }
 
-  // Alle Relations sammeln (für Debug) + Event-Relation bestimmen
+  // alle Relations für späteres Debug
   const relations = Object.entries(db.properties || {})
     .filter(([n, d]) => d?.type === "relation")
     .map(([n, d]) => ({ name: n, type: d.type }));
-
-  // Erst FORCE_EVENT_RELATIONS prüfen
-  let eventRelName = FORCE_EVENT_RELATIONS.find(n => db.properties?.[n]?.type === "relation") || null;
-  if (!eventRelName) {
-    // fallback: mit „event/gig“ im Namen, sonst erste Nicht-Owner-Relation
-    const relCandidates = relations.filter(r => r.name !== ownerName);
-    eventRelName = relCandidates.find(r => /event|gig/i.test(r.name))?.name || relCandidates[0]?.name || null;
-  }
 
   const statusProp = db.properties?.["Status"] ? { name: "Status", type: db.properties["Status"].type } : { name: null, type: null };
   const availName = db.properties?.["Artist availability"] ? "Artist availability"
                    : (db.properties?.["Availability artist"] ? "Availability artist" : null);
   const availType = availName ? db.properties[availName].type : null;
 
-  return { db, ownerName, ownerType, eventRelName, statusProp, availName, availType, relations };
+  return { db, ownerName, ownerType, statusProp, availName, availType, relations };
 }
 
 export default async function handler(req, res) {
@@ -225,12 +212,15 @@ export default async function handler(req, res) {
     const results = [];
     const debugItems = [];
 
+    // Liste aller Relations (außer Owner) aus der DB-Definition
+    const relationNames = info.relations.map(r => r.name).filter(n => n !== info.ownerName);
+
     for (const page of (r.results || [])) {
-      const gigProp = P(page, "Gig");
-      const statusProp = P(page, "Status");
-      const sumProp = P(page, "Summary");
+      const gigProp   = P(page, "Gig");
+      const statusProp= P(page, "Status");
+      const sumProp   = P(page, "Summary");
       const availProp = P(page, "Artist availability") || P(page, "Availability artist");
-      const commProp = P(page, "Artist comment");
+      const commProp  = P(page, "Artist comment");
 
       const gig =
         gigProp?.type === "title" ? plain(gigProp.title) :
@@ -241,18 +231,22 @@ export default async function handler(req, res) {
         statusProp?.type === "select" ? (statusProp.select?.name || "") : "";
 
       let summary = textFrom(sumProp);
-      let viaRel = "";
+      let usedRelation = "";
 
-      // 👉 Summary-Fallback über verknüpfte Event-Seite
-      if (looksEmptySummary(summary) && info.eventRelName) {
-        const evRel = P(page, info.eventRelName);
-        const evId  = evRel?.relation?.[0]?.id;
-        if (evId) {
-          try {
-            const ev = await notion.pages.retrieve({ page_id: evId });
-            const built = await buildSummaryFromEventPage(ev);
-            if (built) { summary = built; viaRel = info.eventRelName; }
-          } catch {}
+      // 👉 Fallback: pro Seite über ALLE Relation-Properties iterieren (außer Owner),
+      // erste Relation mit mind. 1 verknüpfter Seite verwenden
+      if (looksEmptySummary(summary)) {
+        for (const relName of relationNames) {
+          const relProp = P(page, relName);
+          const count = relProp?.relation?.length || 0;
+          const firstId = relProp?.relation?.[0]?.id;
+          if (count > 0 && firstId) {
+            try {
+              const ev = await notion.pages.retrieve({ page_id: firstId });
+              const built = await buildSummaryFromEventPage(ev);
+              if (built) { summary = built; usedRelation = relName; break; }
+            } catch {}
+          }
         }
       }
 
@@ -261,20 +255,12 @@ export default async function handler(req, res) {
         commProp?.type === "rich_text" ? plain(commProp.rich_text) :
         commProp?.type === "title" ? plain(commProp.title) : "";
 
-      results.push({ id: page.id, gig, summary, status: statusTxt, availability, comment, _summaryVia: viaRel });
+      results.push({ id: page.id, gig, summary, status: statusTxt, availability, comment, _summaryVia: usedRelation });
 
       if (String(debug) === "1") {
-        debugItems.push({
-          id: page.id,
-          summaryLen: (summary || "").length,
-          usedRelation: viaRel || null,
-          relationsOnPage: info.relations.reduce((acc, r) => {
-            const rp = P(page, r.name);
-            const count = rp?.relation?.length || 0;
-            acc[r.name] = count;
-            return acc;
-          }, {})
-        });
+        const relOnPage = {};
+        for (const rn of relationNames) relOnPage[rn] = P(page, rn)?.relation?.length || 0;
+        debugItems.push({ id: page.id, usedRelation, relationsOnPage: relOnPage, summaryLen: (summary||"").length });
       }
     }
 
@@ -287,8 +273,7 @@ export default async function handler(req, res) {
       payload.debug = {
         ownerName: info.ownerName,
         ownerType: info.ownerType,
-        eventRelName: info.eventRelName,
-        relationsInDB: info.relations.map(r => r.name),
+        relationNames,
         items: debugItems
       };
     }
