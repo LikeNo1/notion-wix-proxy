@@ -1,4 +1,4 @@
-// /api/events.js — Debug-fähig: includePotential & debug-Infos
+// /api/events.js — bevorzugt RELATION (Artist/Owner), fallback ROLLUP; typgenaue Filter
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -25,7 +25,7 @@ function mapPage(page) {
   const pGig   = P(page, "Gig");
   const pStat  = P(page, "Status");
   const pSum   = P(page, "Summary");
-  const pAvail = P(page, "Artist availability");
+  const pAvail = P(page, "Artist availability") || P(page, "Availability artist");
   const pComm  = P(page, "Artist comment");
 
   const gig =
@@ -83,20 +83,37 @@ async function findArtistByWixId(musicianId) {
   return null;
 }
 
-// Booking-DB-Schema holen (für typgenaue Filter)
+// Booking-DB-Schema analysieren → bevorzugt eine RELATION mit "owner"/"artist" im Namen, sonst ROLLUP
 async function getBookingSchemaInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
-  const pick = names => {
-    for (const n of names) if (db.properties?.[n]) return { name: n, type: db.properties[n].type };
-    return { name: null, type: null };
-  };
-  return {
-    owner:       pick(["OwnerID", "Owner ID"]),      // relation oder rollup
-    status:      pick(["Status"]),                   // status oder select
-    availability:pick(["Artist availability"]),      // select/rich_text/formula
-    summary:     pick(["Summary"]),                  // formula/rich_text/title
-    allProps:    Object.keys(db.properties || {})
-  };
+
+  // alle Relations und Rollups einsammeln
+  const relations = [];
+  const rollups   = [];
+  for (const [name, def] of Object.entries(db.properties || {})) {
+    if (def.type === "relation") relations.push({ name, type: "relation" });
+    if (def.type === "rollup")   rollups.push({ name, type: "rollup" });
+  }
+  // heuristik: bevorzugt "owner"/"artist" im Namen
+  const pickByName = (arr) =>
+    arr.find(p => /owner|artist/i.test(p.name)) || arr[0] || null;
+
+  const ownerRel = pickByName(relations);
+  const ownerRoll= pickByName(rollups);
+
+  // Status / Availability / Summary wie gehabt
+  const prop = n => db.properties?.[n] ? { name: n, type: db.properties[n].type } : { name: null, type: null };
+  const status       = prop("Status");
+  const availability = db.properties?.["Artist availability"]
+    ? { name: "Artist availability", type: db.properties["Artist availability"].type }
+    : (db.properties?.["Availability artist"]
+        ? { name: "Availability artist", type: db.properties["Availability artist"].type }
+        : { name: null, type: null });
+  const summary      = prop("Summary");
+
+  // Owner: Relation bevorzugen, sonst Rollup
+  const owner = ownerRel || ownerRoll || { name: null, type: null };
+  return { owner, status, availability, summary };
 }
 
 export default async function handler(req, res) {
@@ -123,74 +140,44 @@ export default async function handler(req, res) {
     } = req.query || {};
     if (!musicianId) return bad(res, "Missing musicianId");
 
-    // 1) Artist finden
     const artist = await findArtistByWixId(musicianId);
-    if (!artist) {
-      return res.status(404).json({
-        error: "Artist not found by Wix member id",
-        musicianId,
-        hint: "In Artists-DB muss z. B. 'WixOwnerID' (Rich Text) exakt die Member-ID enthalten."
-      });
-    }
+    if (!artist) return res.status(404).json({ error: "Artist not found by Wix member id", musicianId });
 
-    // 2) Booking-DB Schema
     const info = await getBookingSchemaInfo();
-    if (!info.owner.name || !info.owner.type) {
-      return bad(res, "OwnerID property not found in Booking DB", info);
-    }
+    if (!info.owner.name || !info.owner.type) return bad(res, "No owner relation/rollup found in Booking DB", info);
 
-    // 3) Ownership-Filter
-    let ownerFilter = null;
+    // Owner-Filter (Relation bevorzugt)
+    let ownerFilter;
     if (info.owner.type === "relation") {
       ownerFilter = { property: info.owner.name, relation: { contains: artist.id } };
-    } else if (info.owner.type === "rollup") {
-      ownerFilter = { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
     } else {
-      return bad(res, "Unsupported OwnerID property type", info.owner);
+      ownerFilter = { property: info.owner.name, rollup: { any: { relation: { contains: artist.id } } } };
     }
 
-    // 4) Weitere Filter
     const andFilters = [];
 
-    // Potential standardmäßig ausschließen (außer includePotential=1)
     const wantPotential = String(includePotential).trim() === "1";
     if (!wantPotential && info.status.name) {
-      if (info.status.type === "status") {
-        andFilters.push({ property: info.status.name, status: { does_not_equal: "Potential" } });
-      } else if (info.status.type === "select") {
-        andFilters.push({ property: info.status.name, select: { does_not_equal: "Potential" } });
-      }
+      if (info.status.type === "status") andFilters.push({ property: info.status.name, status: { does_not_equal: "Potential" } });
+      else if (info.status.type === "select") andFilters.push({ property: info.status.name, select: { does_not_equal: "Potential" } });
     }
 
-    // Status-Filter (wenn angegeben und nicht "all")
     const statusNorm = String(status).trim();
     if (statusNorm && statusNorm.toLowerCase() !== "all" && info.status.name) {
-      if (info.status.type === "status") {
-        andFilters.push({ property: info.status.name, status: { equals: statusNorm } });
-      } else if (info.status.type === "select") {
-        andFilters.push({ property: info.status.name, select: { equals: statusNorm } });
-      }
+      if (info.status.type === "status") andFilters.push({ property: info.status.name, status: { equals: statusNorm } });
+      else if (info.status.type === "select") andFilters.push({ property: info.status.name, select: { equals: statusNorm } });
     }
 
-    // Availability (typgenau)
     const availNorm = String(availability || "").trim().toLowerCase();
     if (availNorm && availNorm !== "all" && info.availability.name) {
-      const availName =
-        availNorm === "yes" ? "Yes" :
-        availNorm === "no"  ? "No"  :
-        availNorm === "other" ? "Other" : "";
+      const availName = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
       if (availName) {
-        if (info.availability.type === "select") {
-          andFilters.push({ property: info.availability.name, select: { equals: availName } });
-        } else if (info.availability.type === "rich_text") {
-          andFilters.push({ property: info.availability.name, rich_text: { equals: availName } });
-        } else if (info.availability.type === "formula") {
-          andFilters.push({ property: info.availability.name, formula: { string: { equals: availName } } });
-        }
+        if (info.availability.type === "select") andFilters.push({ property: info.availability.name, select: { equals: availName } });
+        else if (info.availability.type === "rich_text") andFilters.push({ property: info.availability.name, rich_text: { equals: availName } });
+        else if (info.availability.type === "formula") andFilters.push({ property: info.availability.name, formula: { string: { equals: availName } } });
       }
     }
 
-    // Suche (Gig + Summary)
     const qNorm = String(q || "").trim();
     if (qNorm) {
       const or = [{ property: "Gig", title: { contains: qNorm } }];
@@ -202,13 +189,11 @@ export default async function handler(req, res) {
       andFilters.push({ or });
     }
 
-    // Sortierung
     const sorts = [];
     if (sort === "gig_asc")      sorts.push({ property: "Gig", direction: "ascending" });
     else if (sort === "gig_desc")sorts.push({ property: "Gig", direction: "descending" });
     else                         sorts.push({ timestamp: "last_edited_time", direction: "descending" });
 
-    // Query ausführen
     const r = await notion.databases.query({
       database_id: DB_BOOK,
       page_size: 30,
@@ -223,17 +208,7 @@ export default async function handler(req, res) {
       nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more
     };
-
-    if (String(debug).trim() === "1") {
-      payload.debug = {
-        artistId: artist.id,
-        ownerInfo: info.owner,
-        statusInfo: info.status,
-        availabilityInfo: info.availability,
-        summaryInfo: info.summary,
-        appliedFilters: { ownerFilter, andFilters }
-      };
-    }
+    if (String(debug).trim() === "1") payload.debug = { artistId: artist.id, ...info, ownerFilter, andFilters };
 
     res.json(payload);
   } catch (e) {
