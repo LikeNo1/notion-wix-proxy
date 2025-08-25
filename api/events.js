@@ -1,4 +1,4 @@
-// /api/events.js – Events für eingeloggte Artists, "Potential" wird serverseitig ausgeschlossen
+// /api/events.js – robustere Artist-Suche, "Potential" ausgeschlossen, Formel-Summary
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -21,7 +21,7 @@ function bad(res, msg, details) {
   return res.status(400).json({ error: msg, details });
 }
 
-// ---- helpers to read properties safely ----
+// ---- helpers ----
 function plain(rich) {
   if (Array.isArray(rich)) return rich.map(n => n?.plain_text || "").join("").trim();
   return "";
@@ -31,23 +31,18 @@ function getProp(page, key) { return page?.properties?.[key]; }
 function mapPage(page) {
   const pGig   = getProp(page, "Gig");
   const pStat  = getProp(page, "Status");
-  const pSum   = getProp(page, "Summary");               // kann Formula ODER rich_text sein
-  const pAvail = getProp(page, "Artist availability");   // Select/Text/Formula
-  const pComm  = getProp(page, "Artist comment");        // rich_text
+  const pSum   = getProp(page, "Summary");
+  const pAvail = getProp(page, "Artist availability");
+  const pComm  = getProp(page, "Artist comment");
 
-  // Gig (Titel)
   const gig =
     pGig?.type === "title" ? plain(pGig.title) :
-    pGig?.type === "rich_text" ? plain(pGig.rich_text) :
-    "";
+    pGig?.type === "rich_text" ? plain(pGig.rich_text) : "";
 
-  // Status (status/select)
   const status =
     pStat?.type === "status" ? (pStat.status?.name || "") :
-    pStat?.type === "select" ? (pStat.select?.name || "") :
-    "";
+    pStat?.type === "select" ? (pStat.select?.name || "") : "";
 
-  // Summary (Formula bevorzugen, sonst rich_text/title)
   let summary = "";
   if (pSum?.type === "formula") {
     const f = pSum.formula;
@@ -61,7 +56,6 @@ function mapPage(page) {
     summary = plain(pSum.title);
   }
 
-  // Availability (Select bevorzugen, sonst Text/Formula)
   let availability = "";
   if (pAvail?.type === "select") {
     availability = pAvail.select?.name || "";
@@ -72,20 +66,42 @@ function mapPage(page) {
     if (f?.type === "string") availability = f.string || "";
   }
 
-  // Comment
   const comment =
     pComm?.type === "rich_text" ? plain(pComm.rich_text) :
-    pComm?.type === "title" ? plain(pComm.title) :
-    "";
+    pComm?.type === "title" ? plain(pComm.title) : "";
 
-  return {
-    id: page.id,
-    gig,
-    summary,
-    status,
-    availability,
-    comment
-  };
+  return { id: page.id, gig, summary, status, availability, comment };
+}
+
+// ---- robust: Artist via WixOwnerID / Wix Owner ID / Wix Member ID finden ----
+async function findArtistByWixId(musicianId) {
+  const idStr = String(musicianId).trim();
+
+  // Kandidaten für Property-Namen in Artists-DB
+  const propNames = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
+
+  // Wir probieren mehrere Filter-Varianten (rich_text equals/contains, title equals/contains, formula.string contains)
+  const filters = [];
+  for (const p of propNames) {
+    filters.push({ property: p, rich_text: { equals: idStr } });
+    filters.push({ property: p, rich_text: { contains: idStr } });
+    filters.push({ property: p, title:     { equals: idStr } });
+    filters.push({ property: p, title:     { contains: idStr } });
+    filters.push({ property: p, formula:   { string: { equals: idStr } } });
+    filters.push({ property: p, formula:   { string: { contains: idStr } } });
+  }
+
+  // Wir versuchen nacheinander; beim ersten Treffer geben wir die Seite zurück
+  for (const f of filters) {
+    try {
+      const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
+      if (r.results?.length) return r.results[0];
+    } catch (e) {
+      // wir ignorieren einzelne Filterfehler (z. B. falscher Property-Typ) und probieren weiter
+      continue;
+    }
+  }
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -111,43 +127,25 @@ export default async function handler(req, res) {
 
     if (!musicianId) return bad(res, "Missing musicianId");
 
-    // 1) Artist finden (über WixOwnerID / Wix Owner ID / Wix Member ID)
-    const idFilters = [
-      { property: "WixOwnerID",     rich_text: { equals: String(musicianId) } },
-      { property: "Wix Owner ID",   rich_text: { equals: String(musicianId) } },
-      { property: "Wix Member ID",  rich_text: { equals: String(musicianId) } }
-    ];
-    let artistPage = null, artistsQueryError = null;
-    for (const f of idFilters) {
-      try {
-        const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
-        if (r.results?.length) { artistPage = r.results[0]; break; }
-      } catch (e) {
-        artistsQueryError = e?.body || e?.message || String(e);
-      }
-    }
+    // 1) Artist finden (robust)
+    const artistPage = await findArtistByWixId(musicianId);
     if (!artistPage) {
       return res.status(404).json({
         error: "Artist not found by Wix member id",
-        hint: "Prüfe ARTISTS_DB_ID und dass 'WixOwnerID' (oder 'Wix Owner ID' / 'Wix Member ID') exakt die Wix-ID enthält.",
-        musicianId,
-        artistsQueryError
+        hint: "Prüfe in der Artists-DB die Property (z. B. 'WixOwnerID') und dass die Member-ID exakt (ohne Leerzeichen) drinsteht."
       });
     }
 
-    // 2) Query-Filter für Booking DB bauen
+    // 2) Query-Filter für Booking DB
     const andFilters = [];
 
-    // 2a) Ownership via Relation ODER Rollup (any.relation.contains)
-    //    - Falls 'OwnerID' Relation ist → relation contains artistPage.id
-    //    - Falls 'OwnerID' Rollup ist → any.relation contains artistPage.id
+    // Ownership via Relation ODER Rollup
     const ownerRelationFilter = {
       or: [
         { property: "OwnerID", relation: { contains: artistPage.id } },
         { property: "Owner ID", relation: { contains: artistPage.id } }
       ]
     };
-    // Für Rollup-Variante (Notion-API: rollup.any.relation.contains)
     const ownerRollupFilter = {
       or: [
         { property: "OwnerID", rollup: { any: { relation: { contains: artistPage.id } } } },
@@ -156,7 +154,7 @@ export default async function handler(req, res) {
     };
     andFilters.push({ or: [ ownerRelationFilter, ownerRollupFilter ] });
 
-    // 2b) Status "Potential" strikt ausschließen
+    // Status "Potential" strikt ausschließen
     andFilters.push({
       or: [
         { property: "Status", status: { does_not_equal: "Potential" } },
@@ -164,7 +162,7 @@ export default async function handler(req, res) {
       ]
     });
 
-    // 2c) Optional: status (nur erlaubte, niemals "all")
+    // Optional: Status (niemals "all")
     const statusNorm = String(status).trim();
     if (statusNorm && statusNorm.toLowerCase() !== "all") {
       andFilters.push({
@@ -175,7 +173,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2d) Optional: availability
+    // Optional: Availability
     const availNorm = String(availability || "").trim().toLowerCase();
     if (availNorm && availNorm !== "all") {
       const availName = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
@@ -190,48 +188,40 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2e) Optional: Suche im Gig-Titel
+    // Optional: Suche (Gig-Titel & Summary-Formel)
     const queryNorm = String(q || "").trim();
     if (queryNorm) {
-      andFilters.push({ property: "Gig", title: { contains: queryNorm } });
+      andFilters.push({
+        or: [
+          { property: "Gig", title: { contains: queryNorm } },
+          { property: "Summary", formula: { string: { contains: queryNorm } } },
+          { property: "Summary", rich_text: { contains: queryNorm } }
+        ]
+      });
     }
 
     const filterObj = andFilters.length ? { and: andFilters } : undefined;
 
-    // 3) Sortierung
+    // Sortierung
     const sorts = [];
-    if (sort === "gig_asc") {
-      sorts.push({ property: "Gig", direction: "ascending" });
-    } else if (sort === "gig_desc") {
-      sorts.push({ property: "Gig", direction: "descending" });
-    } else {
-      // Fallback: zuletzt geändert
-      sorts.push({ timestamp: "last_edited_time", direction: "descending" });
-    }
+    if (sort === "gig_asc")      sorts.push({ property: "Gig", direction: "ascending" });
+    else if (sort === "gig_desc")sorts.push({ property: "Gig", direction: "descending" });
+    else                         sorts.push({ timestamp: "last_edited_time", direction: "descending" });
 
-    // 4) Query ausführen
-    const pageSize = 30;
+    // Query ausführen
     const params = {
       database_id: DB_BOOK,
-      page_size: pageSize,
+      page_size: 30,
       sorts
     };
     if (filterObj) params.filter = filterObj;
-    if (cursor) params.start_cursor = String(cursor);
+    if (cursor)    params.start_cursor = String(cursor);
 
     const r = await notion.databases.query(params);
 
-    // 5) Mappen
+    // Mappen
     const results = (r.results || []).map(mapPage);
-    const nextCursor = r.has_more ? r.next_cursor : null;
-
-    // 6) Antwort
-    res.json({
-      results,
-      nextCursor,
-      hasMore: !!r.has_more
-    });
-
+    res.json({ results, nextCursor: r.has_more ? r.next_cursor : null, hasMore: !!r.has_more });
   } catch (e) {
     console.error("@events error:", e?.body || e?.message || e);
     res.status(500).json({ error: "Server error" });
