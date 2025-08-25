@@ -1,14 +1,12 @@
-// /api/update.js  – schreibt "Artist availability" & "Artist comment" in die Booking-Page
-import { Client } from "@notionhq/client";
+// /api/update.js – Availability/Comment speichern + Status "Artist replied" setzen
+import { Client } from '@notionhq/client';
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
+const DB_BOOK = process.env.BOOKING_DB_ID;
 
-// CORS: erlaube Deinen Wix-Domain(s)
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
+    .split(",").map(s => s.trim()).filter(Boolean);
   const origin = req.headers.origin || "";
   if (!allowed.length || allowed.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
@@ -18,84 +16,77 @@ function cors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
 }
 
-function bad(res, code, msg, details) {
-  return res.status(code).json({ error: msg, details });
-}
-
 export default async function handler(req, res) {
   cors(res, req);
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return bad(res, 405, "Method not allowed");
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const missing = [];
+  if (!process.env.NOTION_TOKEN) missing.push('NOTION_TOKEN');
+  if (!DB_BOOK) missing.push('BOOKING_DB_ID');
+  if (missing.length) return res.status(400).json({ error: 'Missing required env', details: missing });
 
   try {
     const { bookingId, availability, comment, musicianId } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId missing' });
 
-    if (!process.env.NOTION_TOKEN) {
-      return bad(res, 500, "Server misconfigured: NOTION_TOKEN missing");
-    }
-    if (!bookingId) {
-      return bad(res, 400, "bookingId missing");
-    }
+    // 1) Notion page lesen (Status ermitteln)
+    const page = await notion.pages.retrieve({ page_id: bookingId }).catch(() => null);
 
-    // Optional: einfache Verifizierung – Seite existiert
-    // (Wenn du hier zusätzlich prüfen willst, ob die Page zur/m Artist gehört,
-    // kannst du properties.Artist (relation) gegen Deine Artist-ID vergleichen.)
-    let page;
-    try {
-      page = await notion.pages.retrieve({ page_id: bookingId });
-    } catch (e) {
-      return bad(res, 404, "Booking page not found", e.body || e.message);
+    // 2) Eigenschaften bauen
+    const properties = {};
+
+    // Artist availability (Select/Text)
+    if (typeof availability === 'string') {
+      // wenn Select-Property:
+      properties['Artist availability'] = { select: availability ? { name: availability } : null };
+      // Fallback (falls in Deiner DB Rich Text sein sollte):
+      // properties['Artist availability'] = { rich_text: availability ? [{ type:'text', text:{ content: availability } }] : [] };
     }
 
-    // Update-Objekt bauen
-    const props = {};
-
-    // Availability: leer lassen = nichts ändern; String "" = Select leeren
-    if (typeof availability !== "undefined") {
-      const normalized =
-        availability === null || availability === ""
-          ? null
-          : String(availability).trim();
-
-      if (normalized === null) {
-        props["Artist availability"] = { select: null };
-      } else {
-        // nur erlaubte Werte
-        const ALLOWED = new Set(["Yes", "No", "Other"]);
-        if (ALLOWED.has(normalized)) {
-          props["Artist availability"] = { select: { name: normalized } };
-        } else {
-          return bad(res, 400, "Invalid availability value", {
-            received: availability,
-            allowed: Array.from(ALLOWED),
-          });
-        }
-      }
-    }
-
-    // Comment: wenn String leer -> Text leeren
-    if (typeof comment !== "undefined") {
-      const text = String(comment || "");
-      // Notion Limit: pro Segment ca. 2000 Zeichen – zur Sicherheit beschneiden
-      const safe = text.slice(0, 1900);
-      props["Artist comment"] = {
-        rich_text: safe ? [{ type: "text", text: { content: safe } }] : [],
+    // Artist comment (Rich Text)
+    if (typeof comment === 'string') {
+      properties['Artist comment'] = {
+        rich_text: comment ? [{ type: 'text', text: { content: comment } }] : []
       };
     }
 
-    if (!Object.keys(props).length) {
-      return bad(res, 400, "No properties to update");
+    // 3) Status auf "Artist replied" setzen (wenn Status-Property existiert)
+    //    final / rote Stati lassen wir unangetastet.
+    const finalStatus = new Set(['Cancelled/Declined', 'Completed', 'Post-show', 'Confirmed/In progress']);
+    let shouldTouchStatus = true;
+
+    if (page?.properties?.Status) {
+      const p = page.properties.Status;
+      const current =
+        p.type === 'status' ? (p.status?.name || '') :
+        p.type === 'select' ? (p.select?.name || '') : '';
+
+      if (finalStatus.has(current)) {
+        shouldTouchStatus = false;
+      }
+      if (shouldTouchStatus) {
+        properties['Status'] = (p.type === 'status')
+          ? { status: { name: 'Artist replied' } }
+          : { select: { name: 'Artist replied' } };
+      }
     }
 
-    // Update ausführen
+    // 4) Update ausführen
     await notion.pages.update({
       page_id: bookingId,
-      properties: props,
+      properties
     });
 
-    return res.json({ ok: true });
+    // Optional: Kommentar an die Notion-Page hängen
+    // await notion.comments.create({
+    //   parent: { page_id: bookingId },
+    //   rich_text: [{ type: 'text', text: { content: `Artist updated via Wix (${musicianId || 'unknown'})` } }]
+    // });
+
+    res.json({ ok: true });
   } catch (e) {
-    console.error("update error:", e?.body || e?.message || e);
-    return bad(res, 500, "Server error", e?.body || e?.message || String(e));
+    console.error('@update error:', e?.body || e?.message || e);
+    return res.status(500).json({ error: 'Server error', details: e?.body || e?.message || String(e) });
   }
 }
