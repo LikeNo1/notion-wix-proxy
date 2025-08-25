@@ -1,9 +1,13 @@
-// /api/events.js – holt Summary direkt aus der verknüpften Event-Seite, wenn Formula/ Rollups leer wirken
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 const DB_ART  = process.env.ARTISTS_DB_ID;
+
+// 👉 Falls Deine Event-Relation anders heißt, hier ergänzen/ändern:
+const FORCE_EVENT_RELATIONS = [
+  "Events", "Event", "Gig", "Linked Event", "Linked Events"
+];
 
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
@@ -21,20 +25,20 @@ function bad(res, msg, details) { return res.status(400).json({ error: msg, deta
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
 
-// --------- Notion value helpers ---------
+// ---------- generic readers ----------
 function textFrom(prop) {
   if (!prop) return "";
   switch (prop.type) {
-    case "title":       return plain(prop.title);
-    case "rich_text":   return plain(prop.rich_text);
-    case "url":         return prop.url || "";
-    case "email":       return prop.email || "";
-    case "phone_number":return prop.phone_number || "";
-    case "number":      return (prop.number ?? "") + "";
-    case "status":      return prop.status?.name || "";
-    case "select":      return prop.select?.name || "";
-    case "multi_select":return (prop.multi_select || []).map(o => o.name).join(", ");
-    case "date":        return prop.date?.start || "";
+    case "title":        return plain(prop.title);
+    case "rich_text":    return plain(prop.rich_text);
+    case "url":          return prop.url || "";
+    case "email":        return prop.email || "";
+    case "phone_number": return prop.phone_number || "";
+    case "number":       return (prop.number ?? "") + "";
+    case "status":       return prop.status?.name || "";
+    case "select":       return prop.select?.name || "";
+    case "multi_select": return (prop.multi_select || []).map(o => o.name).join(", ");
+    case "date":         return prop.date?.start || "";
     case "formula": {
       const f = prop.formula || {};
       if (f.type === "string") return f.string || "";
@@ -55,8 +59,6 @@ function textFrom(prop) {
     default: return "";
   }
 }
-
-// liest einen Satz typischer Namen robust (z. B. "Short description" vs "Short Description")
 function readAny(ev, names) {
   for (const n of names) {
     const p = ev.properties?.[n];
@@ -65,46 +67,34 @@ function readAny(ev, names) {
   }
   return "";
 }
-
-// Summary direkt aus Event-Seite aufbauen
 async function buildSummaryFromEventPage(eventPage) {
   if (!eventPage) return "";
-
-  const date = readAny(eventPage, [
-    process.env.EVENT_PROP_DATE || "Date + Time",
-    "Date", "Datetime", "Date/Time"
-  ]);
-  const country = readAny(eventPage, [ "Country" ]);
+  const date     = readAny(eventPage, [ process.env.EVENT_PROP_DATE || "Date + Time", "Date", "Datetime", "Date/Time" ]);
+  const country  = readAny(eventPage, [ "Country" ]);
   const location = readAny(eventPage, [ "Location", "City" ]);
-  const website = readAny(eventPage, [ "Website", "Web", "URL" ]);
-  const instagram = readAny(eventPage, [ "Instagram", "IG" ]);
+  const website  = readAny(eventPage, [ "Website", "Web", "URL" ]);
+  const instagram= readAny(eventPage, [ "Instagram", "IG" ]);
   const facebook = readAny(eventPage, [ "Facebook", "FB" ]);
-  const shortDesc = readAny(eventPage, [ "Short description", "Short Description" ]);
-  const vibe = readAny(eventPage, [ "Vibe/Notes", "Vibe", "Notes" ]);
+  const shortD   = readAny(eventPage, [ "Short description", "Short Description" ]);
+  const vibe     = readAny(eventPage, [ "Vibe/Notes", "Vibe", "Notes" ]);
 
   const lines = [];
   lines.push(`📅 Datum/Zeit: ${date || "noch zu terminieren"}`);
   lines.push(`🗺️ Location: ${[country, location].filter(Boolean).join("/") || "/"}`);
-  lines.push(`🔗 Link: ${[website, instagram, facebook].filter(Boolean).join(" ") || ""}`.trim());
-  lines.push(`📃 Beschreibung und Vibe:${(shortDesc || vibe) ? "" : ""}`);
-  if (shortDesc) lines.push(shortDesc);
-  if (vibe)      lines.push(vibe);
-
+  lines.push(`🔗 Link: ${[website, instagram, facebook].filter(Boolean).join(" ")}`.trim());
+  lines.push(`📃 Beschreibung und Vibe:${(shortD || vibe) ? "" : ""}`);
+  if (shortD) lines.push(shortD);
+  if (vibe)   lines.push(vibe);
   return lines.join("\n").trim();
 }
-
-// eine Event-Seite aus beliebigen Relations (außer Owner/Artist) holen
-function firstEventRelationName(dbProps, ownerName) {
-  // bevorzugt Namen mit Event/Gig
-  const rels = Object.entries(dbProps || {})
-    .filter(([n, d]) => d?.type === "relation" && n !== ownerName)
-    .map(([n]) => n);
-
-  let pick = rels.find(n => /event|gig/i.test(n));
-  if (!pick) pick = rels[0] || null;
-  return pick;
+function looksEmptySummary(s) {
+  if (!s) return true;
+  const template = "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:   \n📃 Beschreibung und Vibe:";
+  if (s.trim() === template) return true;
+  return s.replace(/\s+/g, "").length < 15;
 }
 
+// ---------- DB helpers ----------
 async function findArtistByWixId(musicianId) {
   const id = String(musicianId).trim();
   const names = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
@@ -128,7 +118,8 @@ async function findArtistByWixId(musicianId) {
 
 async function getBookingInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
-  // Owner/Artist Relation/Rollup
+
+  // Owner/Artist Relation/Rollup finden
   let ownerName = null, ownerType = null;
   for (const [name, def] of Object.entries(db.properties || {})) {
     if ((/owner|artist/i.test(name)) && (def.type === "relation" || def.type === "rollup")) {
@@ -136,24 +127,30 @@ async function getBookingInfo() {
     }
   }
   if (!ownerName) {
-    // fallback: erstes relation/rollup nehmen
     for (const [name, def] of Object.entries(db.properties || {})) {
       if (def.type === "relation" || def.type === "rollup") { ownerName = name; ownerType = def.type; break; }
     }
   }
-  const eventRelName = firstEventRelationName(db.properties, ownerName);
-  const statusProp = db.properties?.["Status"] ? { name: "Status", type: db.properties["Status"].type } : { name: null, type: null };
-  const availName = db.properties?.["Artist availability"] ? "Artist availability" :
-                    (db.properties?.["Availability artist"] ? "Availability artist" : null);
-  const availType = availName ? db.properties[availName].type : null;
-  return { db, ownerName, ownerType, eventRelName, statusProp, availName, availType };
-}
 
-function looksEmptySummary(s) {
-  if (!s) return true;
-  const template = "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:   \n📃 Beschreibung und Vibe:";
-  if (s.trim() === template) return true;
-  return s.replace(/\s+/g, "").length < 15;
+  // Alle Relations sammeln (für Debug) + Event-Relation bestimmen
+  const relations = Object.entries(db.properties || {})
+    .filter(([n, d]) => d?.type === "relation")
+    .map(([n, d]) => ({ name: n, type: d.type }));
+
+  // Erst FORCE_EVENT_RELATIONS prüfen
+  let eventRelName = FORCE_EVENT_RELATIONS.find(n => db.properties?.[n]?.type === "relation") || null;
+  if (!eventRelName) {
+    // fallback: mit „event/gig“ im Namen, sonst erste Nicht-Owner-Relation
+    const relCandidates = relations.filter(r => r.name !== ownerName);
+    eventRelName = relCandidates.find(r => /event|gig/i.test(r.name))?.name || relCandidates[0]?.name || null;
+  }
+
+  const statusProp = db.properties?.["Status"] ? { name: "Status", type: db.properties["Status"].type } : { name: null, type: null };
+  const availName = db.properties?.["Artist availability"] ? "Artist availability"
+                   : (db.properties?.["Availability artist"] ? "Availability artist" : null);
+  const availType = availName ? db.properties[availName].type : null;
+
+  return { db, ownerName, ownerType, eventRelName, statusProp, availName, availType, relations };
 }
 
 export default async function handler(req, res) {
@@ -184,15 +181,13 @@ export default async function handler(req, res) {
     if (!artist) return res.status(404).json({ error: "Artist not found by Wix member id", musicianId });
 
     const info = await getBookingInfo();
-    if (!info.ownerName || !info.ownerType) return bad(res, "Owner relation/rollup not found in Booking DB");
+    if (!info.ownerName || !info.ownerType) return bad(res, "Owner relation/rollup not found in Booking DB", info);
 
-    // Owner-Filter
     const ownerFilter =
       info.ownerType === "relation"
         ? { property: info.ownerName, relation: { contains: artist.id } }
         : { property: info.ownerName, rollup: { any: { relation: { contains: artist.id } } } };
 
-    // weitere Filter
     const andFilters = [];
     if (info.statusProp.name && String(includePotential) !== "1") {
       if (info.statusProp.type === "status") andFilters.push({ property: "Status", status: { does_not_equal: "Potential" } });
@@ -215,12 +210,10 @@ export default async function handler(req, res) {
     }
     if (q) andFilters.push({ or: [{ property: "Gig", title: { contains: String(q) } }] });
 
-    // Sortierung
     const sorts = sort === "gig_desc" ? [{ property: "Gig", direction: "descending" }]
       : sort === "gig_asc" ? [{ property: "Gig", direction: "ascending" }]
       : [{ timestamp: "last_edited_time", direction: "descending" }];
 
-    // Query Booking DB
     const r = await notion.databases.query({
       database_id: DB_BOOK,
       page_size: 30,
@@ -229,8 +222,9 @@ export default async function handler(req, res) {
       sorts
     });
 
-    // Mappen + ggf. Event-Page lesen
     const results = [];
+    const debugItems = [];
+
     for (const page of (r.results || [])) {
       const gigProp = P(page, "Gig");
       const statusProp = P(page, "Status");
@@ -247,17 +241,17 @@ export default async function handler(req, res) {
         statusProp?.type === "select" ? (statusProp.select?.name || "") : "";
 
       let summary = textFrom(sumProp);
+      let viaRel = "";
 
-      // Fallback: Event-Relation auslesen und Summary bauen
-      let usedRel = "";
+      // 👉 Summary-Fallback über verknüpfte Event-Seite
       if (looksEmptySummary(summary) && info.eventRelName) {
         const evRel = P(page, info.eventRelName);
-        const evId = evRel?.relation?.[0]?.id;
+        const evId  = evRel?.relation?.[0]?.id;
         if (evId) {
           try {
             const ev = await notion.pages.retrieve({ page_id: evId });
             const built = await buildSummaryFromEventPage(ev);
-            if (built) { summary = built; usedRel = info.eventRelName; }
+            if (built) { summary = built; viaRel = info.eventRelName; }
           } catch {}
         }
       }
@@ -267,15 +261,21 @@ export default async function handler(req, res) {
         commProp?.type === "rich_text" ? plain(commProp.rich_text) :
         commProp?.type === "title" ? plain(commProp.title) : "";
 
-      results.push({
-        id: page.id,
-        gig,
-        summary,
-        status: statusTxt,
-        availability,
-        comment,
-        _summaryVia: usedRel
-      });
+      results.push({ id: page.id, gig, summary, status: statusTxt, availability, comment, _summaryVia: viaRel });
+
+      if (String(debug) === "1") {
+        debugItems.push({
+          id: page.id,
+          summaryLen: (summary || "").length,
+          usedRelation: viaRel || null,
+          relationsOnPage: info.relations.reduce((acc, r) => {
+            const rp = P(page, r.name);
+            const count = rp?.relation?.length || 0;
+            acc[r.name] = count;
+            return acc;
+          }, {})
+        });
+      }
     }
 
     const payload = {
@@ -288,8 +288,8 @@ export default async function handler(req, res) {
         ownerName: info.ownerName,
         ownerType: info.ownerType,
         eventRelName: info.eventRelName,
-        availName: info.availName,
-        availType: info.availType
+        relationsInDB: info.relations.map(r => r.name),
+        items: debugItems
       };
     }
     res.json(payload);
