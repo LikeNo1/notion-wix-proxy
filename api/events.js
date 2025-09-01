@@ -17,13 +17,8 @@ function cors(res, req) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
 }
-function bad(res, msg, details) {
-  return res.status(400).json({ error: msg, details });
-}
-function plain(rich) {
-  if (Array.isArray(rich)) return rich.map(n => n?.plain_text || '').join('').trim();
-  return '';
-}
+function bad(res, msg, details) { return res.status(400).json({ error: msg, details }); }
+function plain(rich) { return Array.isArray(rich) ? rich.map(n => n?.plain_text || '').join('').trim() : ''; }
 function getProp(page, key) { return page?.properties?.[key]; }
 
 function extractTextFromProp(prop) {
@@ -43,13 +38,7 @@ function extractTextFromProp(prop) {
     case 'rollup': {
       const r = prop.rollup;
       if (!r) return '';
-      if (r.type === 'array') {
-        return (r.array || [])
-          .map(x => extractTextFromProp(x))
-          .filter(Boolean)
-          .join(' ')
-          .trim();
-      }
+      if (r.type === 'array') return (r.array || []).map(x => extractTextFromProp(x)).filter(Boolean).join(' ').trim();
       if (r.type === 'number') return (typeof r.number === 'number') ? String(r.number) : '';
       if (r.type === 'date')   return r.date?.start || '';
       return '';
@@ -61,7 +50,7 @@ function extractTextFromProp(prop) {
 function mapBookingPage(page) {
   const pGig   = getProp(page, 'Gig');
   const pStat  = getProp(page, 'Status');
-  const pSum   = getProp(page, 'Summary');              // Summary direkt
+  const pSum   = getProp(page, 'Summary');              // Summary direkt (Formula/Rollup/Text)
   const pAvail = getProp(page, 'Artist availability');
   const pComm  = getProp(page, 'Artist comment');
 
@@ -78,19 +67,13 @@ function mapBookingPage(page) {
   let availability = '';
   if (pAvail?.type === 'select')         availability = pAvail.select?.name || '';
   else if (pAvail?.type === 'rich_text') availability = plain(pAvail.rich_text);
-  else if (pAvail?.type === 'formula') {
-    const f = pAvail.formula;
-    if (f?.type === 'string') availability = f.string || '';
-  }
+  else if (pAvail?.type === 'formula')   availability = (pAvail.formula?.type === 'string') ? (pAvail.formula.string || '') : '';
 
   const comment =
     pComm?.type === 'rich_text' ? plain(pComm.rich_text) :
     pComm?.type === 'title' ? plain(pComm.title) : '';
 
-  return {
-    id: page.id,
-    gig, summary, status, availability, comment
-  };
+  return { id: page.id, gig, summary, status, availability, comment };
 }
 
 function normalizeStatus(s = '') {
@@ -99,7 +82,33 @@ function normalizeStatus(s = '') {
   return str;
 }
 
-// ---- Handler --------------------------------------------------------
+// --- Baue je Property beide möglichen Filter ---
+function buildRelationFilter(property, artistId) {
+  return { property, relation: { contains: artistId } };
+}
+function buildRollupFilter(property, artistId) {
+  return { property, rollup: { any: { relation: { contains: artistId } } } };
+}
+
+// Testet per 1-Item-Query, ob ein Filter in deiner DB gültig ist
+async function isFilterValid(databaseId, filterObj) {
+  try {
+    await notion.databases.query({
+      database_id: databaseId,
+      page_size: 1,
+      filter: filterObj
+    });
+    return true;
+  } catch (e) {
+    // nur echte Schema-/Typfehler ausschließen
+    const code = e?.body?.code || e?.code || '';
+    const msg  = e?.body?.message || e?.message || '';
+    if (code === 'validation_error' || /does not match/.test(msg)) return false;
+    // andere Fehler (Rate limit etc.) lassen wir durchgehen
+    return true;
+  }
+}
+
 export default async function handler(req, res) {
   cors(res, req);
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -142,29 +151,33 @@ export default async function handler(req, res) {
     if (!artistPage) {
       return res.status(404).json({
         error: 'Artist not found by Wix member id',
-        hint: 'Prüfe ARTISTS_DB_ID und dass die Wix-ID exakt in einem Textfeld steht.',
+        hint: 'Prüfe ARTISTS_DB_ID und stelle sicher, dass die Wix-ID exakt in einem Textfeld steht.',
         musicianId,
         artistsQueryError
       });
     }
 
-    // 2) Booking-DB Schema holen und Eigentümer-Filter dynamisch bauen
-    const meta = await notion.databases.retrieve({ database_id: DB_BOOK });
-    const ownerCandidates = ['Artist','OwnerID','Owner ID'];
-    const ownerOr = [];
+    const artistId = artistPage.id;
 
-    for (const name of ownerCandidates) {
-      const p = meta.properties?.[name];
-      if (!p || !p.type) continue;
-      if (p.type === 'relation') {
-        ownerOr.push({ property: name, relation: { contains: artistPage.id } });
-      } else if (p.type === 'rollup') {
-        ownerOr.push({ property: name, rollup: { any: { relation: { contains: artistPage.id } } } });
+    // 2) Gültige Owner-Filter vorab „probieren“
+    const ownerCandidates = ['Artist', 'OwnerID', 'Owner ID'];
+    const ownerOr = [];
+    for (const propName of ownerCandidates) {
+      // Relation-Probe
+      const relSingle = buildRelationFilter(propName, artistId);
+      const relValid  = await isFilterValid(DB_BOOK, relSingle);
+      if (relValid) {
+        ownerOr.push(relSingle);
+        continue; // Relation funktioniert – Rollup-Variante unnötig
       }
+      // Rollup-Probe
+      const rollSingle = buildRollupFilter(propName, artistId);
+      const rollValid  = await isFilterValid(DB_BOOK, rollSingle);
+      if (rollValid) ownerOr.push(rollSingle);
     }
 
     if (!ownerOr.length) {
-      return bad(res, 'No owner relation/rollup property found in Booking DB', { tried: ownerCandidates });
+      return bad(res, 'No usable owner filter in Booking DB', { tried: ownerCandidates });
     }
 
     const andFilters = [{ or: ownerOr }];
@@ -196,9 +209,9 @@ export default async function handler(req, res) {
 
     // 3) Sortierung
     const sorts = [];
-    if (sort === 'gig_asc')  sorts.push({ property: 'Gig', direction: 'ascending' });
-    else if (sort === 'gig_desc') sorts.push({ property: 'Gig', direction: 'descending' });
-    else sorts.push({ timestamp: 'last_edited_time', direction: 'descending' });
+    if (sort === 'gig_asc')      sorts.push({ property: 'Gig', direction: 'ascending' });
+    else if (sort === 'gig_desc')sorts.push({ property: 'Gig', direction: 'descending' });
+    else                        sorts.push({ timestamp: 'last_edited_time', direction: 'descending' });
 
     // 4) Query
     let size = parseInt(pageSize, 10);
@@ -219,17 +232,15 @@ export default async function handler(req, res) {
       .map(mapBookingPage)
       .map(x => ({ ...x, status: normalizeStatus(x.status) }));
 
-    const nextCursor = r.has_more ? r.next_cursor : null;
-
-    // 6) Antwort (+ Debug optional)
+    // 6) Antwort
     res.json({
       results,
-      nextCursor,
+      nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more,
       debug: debug ? {
-        ownerPropsFound: ownerOr.map(o => o.property),
-        summaryType: getProp(r.results?.[0], 'Summary')?.type || null,
-        statusType:  getProp(r.results?.[0], 'Status')?.type || null
+        artistId,
+        ownerFiltersUsed: ownerOr,
+        pageSize: size
       } : undefined
     });
 
