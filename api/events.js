@@ -5,6 +5,7 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 const DB_ART  = process.env.ARTISTS_DB_ID;
 
+// ---- CORS / Helpers -------------------------------------------------
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -27,8 +28,6 @@ function textFrom(prop) {
     case "title":        return plain(prop.title);
     case "rich_text":    return plain(prop.rich_text);
     case "url":          return prop.url || "";
-    case "email":        return prop.email || "";
-    case "phone_number": return prop.phone_number || "";
     case "number":       return (prop.number ?? "") + "";
     case "status":       return prop.status?.name || "";
     case "select":       return prop.select?.name || "";
@@ -55,7 +54,6 @@ function textFrom(prop) {
     default: return "";
   }
 }
-
 function readAny(page, names) {
   for (const n of names) {
     const v = textFrom(P(page, n));
@@ -64,6 +62,7 @@ function readAny(page, names) {
   return "";
 }
 
+// Artist anhand Wix-Member-ID finden (sehr tolerant)
 async function findArtistByWixId(musicianId) {
   const id = String(musicianId || "").trim();
   const names = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
@@ -85,6 +84,7 @@ async function findArtistByWixId(musicianId) {
   return null;
 }
 
+// Booking-DB-Struktur auslesen (Owner-Relation/Rollup + evtl. Event-Relationen)
 async function getBookingInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
 
@@ -109,7 +109,7 @@ async function getBookingInfo() {
     : (db.properties?.["Availability artist"] ? "Availability artist" : null);
   const availType = availName ? db.properties[availName].type : null;
 
-  // Event-Relation Kandidaten (Name enthält "event" oder "gig")
+  // Event-Relation-Kandidaten (Name enthält „event“ oder „gig“)
   const eventRelationCandidates = Object.entries(db.properties || {})
     .filter(([name, def]) => def.type === "relation" && (/event|gig/i.test(name)))
     .map(([name]) => name);
@@ -130,6 +130,7 @@ function pickEventRelationName(page, ownerName, candidates) {
   return null;
 }
 
+// Simple Page-Cache
 const pageCache = new Map();
 async function getPage(id) {
   if (pageCache.has(id)) return pageCache.get(id);
@@ -138,11 +139,11 @@ async function getPage(id) {
   return pg;
 }
 
+// Summary aus Event-Page zusammenbauen
 function composeSummaryFromEvent(evtPage) {
-  // liest direkt die Event-Felder (egal ob select/rich_text/rollup/whatever)
   const date      = readAny(evtPage, ["Date + Time", "Date", "Datetime", "Date/Time"]);
   const country   = readAny(evtPage, ["Country"]);
-  const statede   = readAny(evtPage, ["Bundesland (nur DE)"]);
+  const statede   = readAny(evtPage, ["Bundesland (nur DE)", "Bundesland", "State"]);
   const location  = readAny(evtPage, ["Location", "City"]);
   const website   = readAny(evtPage, ["Website", "Web", "URL"]);
   const instagram = readAny(evtPage, ["Instagram", "IG"]);
@@ -164,6 +165,7 @@ function composeSummaryFromEvent(evtPage) {
   return lines.join("\n").trim();
 }
 
+// ---- Handler --------------------------------------------------------
 export default async function handler(req, res) {
   cors(res, req);
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -181,9 +183,7 @@ export default async function handler(req, res) {
       cursor = null,
       q = "",
       sort = "gig_asc",
-      availability = "all",
-      status = "all",
-      debug = "0"
+      status = "all"
     } = req.query || {};
     if (!musicianId) return bad(res, "Missing musicianId");
 
@@ -196,7 +196,7 @@ export default async function handler(req, res) {
     if (!info.ownerName || !info.ownerType)
       return bad(res, "Owner relation/rollup not found in Booking DB", info);
 
-    // 3) Filter bauen
+    // 3) Filter
     const ownerFilter =
       info.ownerType === "relation"
         ? { property: info.ownerName, relation: { contains: artist.id } }
@@ -204,7 +204,6 @@ export default async function handler(req, res) {
 
     const andFilters = [];
 
-    // Status ≠ Potential (wenn vorhanden)
     if (info.statusProp.name) {
       if (info.statusProp.type === "status")
         andFilters.push({ property: "Status", status: { does_not_equal: "Potential" } });
@@ -212,25 +211,12 @@ export default async function handler(req, res) {
         andFilters.push({ property: "Status", select: { does_not_equal: "Potential" } });
     }
 
-    // optional Status-Filter
     const statusNorm = String(status).trim();
     if (info.statusProp.name && statusNorm && statusNorm.toLowerCase() !== "all") {
       if (info.statusProp.type === "status")
         andFilters.push({ property: "Status", status: { equals: statusNorm } });
       else if (info.statusProp.type === "select")
         andFilters.push({ property: "Status", select: { equals: statusNorm } });
-    }
-
-    // optional Availability
-    const availNorm = String(availability || "").trim().toLowerCase();
-    if (info.availName && availNorm && availNorm !== "all") {
-      const name = availNorm === "yes" ? "Yes" : availNorm === "no" ? "No" : availNorm === "other" ? "Other" : "";
-      if (name) {
-        if (info.availType === "select")        andFilters.push({ property: info.availName, select: { equals: name } });
-        else if (info.availType === "rich_text") andFilters.push({ property: info.availName, rich_text: { equals: name } });
-        else if (info.availType === "formula")   andFilters.push({ property: info.availName, formula: { string: { equals: name } } });
-        else if (info.availType === "rollup")    andFilters.push({ property: info.availName, rollup: { any: { rich_text: { equals: name } } } });
-      }
     }
 
     if (q) andFilters.push({ property: "Gig", title: { contains: String(q) } });
@@ -241,15 +227,17 @@ export default async function handler(req, res) {
                             [{ timestamp: "last_edited_time", direction: "descending" }];
 
     // 4) Query Booking
-    const r = await notion.databases.query({
+    const params = {
       database_id: DB_BOOK,
       page_size: 30,
-      start_cursor: cursor || undefined,
-      filter: { and: [ownerFilter, ...andFilters] },
-      sorts
-    });
+      sorts,
+      filter: { and: [ownerFilter, ...andFilters] }
+    };
+    if (cursor) params.start_cursor = String(cursor);
 
-    // 5) Mapping – Summary immer aus Event-Feldern zusammensetzen
+    const r = await notion.databases.query(params);
+
+    // 5) Mapping – Summary aus Event (wenn vorhanden), sonst Fallback
     const results = [];
     for (const page of (r.results || [])) {
       const gigProp    = P(page, "Gig");
@@ -272,7 +260,6 @@ export default async function handler(req, res) {
 
       // Event-Relation finden
       const eventRelName = pickEventRelationName(page, info.ownerName, info.eventRelationCandidates);
-
       let summary = "";
       let summaryVia = "";
 
@@ -283,17 +270,14 @@ export default async function handler(req, res) {
           if (evtId) {
             try {
               const evtPage = await getPage(evtId);
-              summary = composeSummaryFromEvent(evtPage); // **hier wird gebaut**
+              summary = composeSummaryFromEvent(evtPage);
               if (summary) summaryVia = `event:${eventRelName}`;
-            } catch (e) {
-              // ignorieren – fällt auf Fallbacks zurück
-            }
+            } catch {}
           }
         }
       }
 
       if (!summary) {
-        // extrem defensiver Fallback (immer etwas anzeigen)
         summary = "📅 Datum/Zeit: noch zu terminieren\n🗺️ Location: /\n🔗 Link:  \n📃 Beschreibung und Vibe:";
         summaryVia = "fallback";
       }
