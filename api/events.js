@@ -2,9 +2,9 @@
 import { Client } from '@notionhq/client';
 
 // === ENV ===
-const notion   = new Client({ auth: process.env.NOTION_TOKEN });
-const DB_BOOK  = process.env.BOOKING_DB_ID;
-const DB_ART   = process.env.ARTISTS_DB_ID;
+const notion  = new Client({ auth: process.env.NOTION_TOKEN });
+const DB_BOOK = process.env.BOOKING_DB_ID;
+const DB_ART  = process.env.ARTISTS_DB_ID;
 
 // ---- CORS / Helpers -------------------------------------------------
 function cors(res, req) {
@@ -40,20 +40,18 @@ function extractTextFromProp(prop) {
     }
     case 'rich_text': return plain(prop.rich_text);
     case 'title':     return plain(prop.title);
-    case 'rollup': {  // falls Summary ein Rollup ist (z.B. rollup.string)
+    case 'rollup': {
       const r = prop.rollup;
       if (!r) return '';
       if (r.type === 'array') {
-        // Ziehe Plaintext aus Teilobjekten (häufig title/rich_text in array)
         return (r.array || [])
-          .map(x => extractTextFromProp(x)) // rekursiv
+          .map(x => extractTextFromProp(x))
           .filter(Boolean)
           .join(' ')
           .trim();
       }
       if (r.type === 'number') return (typeof r.number === 'number') ? String(r.number) : '';
       if (r.type === 'date')   return r.date?.start || '';
-      if (r.type === 'unsupported') return '';
       return '';
     }
     default: return '';
@@ -63,7 +61,7 @@ function extractTextFromProp(prop) {
 function mapBookingPage(page) {
   const pGig   = getProp(page, 'Gig');
   const pStat  = getProp(page, 'Status');
-  const pSum   = getProp(page, 'Summary');              // Summary direkt (Formula / Rollup / Text)
+  const pSum   = getProp(page, 'Summary');              // Summary direkt
   const pAvail = getProp(page, 'Artist availability');
   const pComm  = getProp(page, 'Artist comment');
 
@@ -120,7 +118,8 @@ export default async function handler(req, res) {
       q = '',
       sort = 'gig_asc',
       status = 'all',
-      pageSize // optional: 10 / 20 / 30 …
+      pageSize,
+      debug
     } = req.query || {};
 
     if (!musicianId) return bad(res, 'Missing musicianId');
@@ -149,19 +148,26 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2) Filter Booking-DB
-    const andFilters = [];
+    // 2) Booking-DB Schema holen und Eigentümer-Filter dynamisch bauen
+    const meta = await notion.databases.retrieve({ database_id: DB_BOOK });
+    const ownerCandidates = ['Artist','OwnerID','Owner ID'];
+    const ownerOr = [];
 
-    // Eigentümer: flache OR-Liste (Relation + Rollup)
-    const ownerOr = [
-      { property: 'OwnerID', relation: { contains: artistPage.id } },
-      { property: 'Owner ID', relation: { contains: artistPage.id } },
-      { property: 'Artist',  relation: { contains: artistPage.id } },
+    for (const name of ownerCandidates) {
+      const p = meta.properties?.[name];
+      if (!p || !p.type) continue;
+      if (p.type === 'relation') {
+        ownerOr.push({ property: name, relation: { contains: artistPage.id } });
+      } else if (p.type === 'rollup') {
+        ownerOr.push({ property: name, rollup: { any: { relation: { contains: artistPage.id } } } });
+      }
+    }
 
-      { property: 'OwnerID', rollup: { any: { relation: { contains: artistPage.id } } } },
-      { property: 'Owner ID', rollup: { any: { relation: { contains: artistPage.id } } } }
-    ];
-    andFilters.push({ or: ownerOr });
+    if (!ownerOr.length) {
+      return bad(res, 'No owner relation/rollup property found in Booking DB', { tried: ownerCandidates });
+    }
+
+    const andFilters = [{ or: ownerOr }];
 
     // "Potential" strikt ausschließen
     andFilters.push({
@@ -186,7 +192,7 @@ export default async function handler(req, res) {
     const qNorm = String(q || '').trim();
     if (qNorm) andFilters.push({ property: 'Gig', title: { contains: qNorm } });
 
-    const filterObj = andFilters.length ? { and: andFilters } : undefined;
+    const filterObj = { and: andFilters };
 
     // 3) Sortierung
     const sorts = [];
@@ -201,34 +207,33 @@ export default async function handler(req, res) {
     const params = {
       database_id: DB_BOOK,
       page_size: size,
-      sorts
+      sorts,
+      filter: filterObj
     };
-    if (filterObj) params.filter = filterObj;
-    if (cursor)    params.start_cursor = String(cursor);
+    if (cursor) params.start_cursor = String(cursor);
 
     const r = await notion.databases.query(params);
 
-    // 5) Mappen
+    // 5) Mappen + Status normalisieren
     const results = (r.results || [])
       .map(mapBookingPage)
       .map(x => ({ ...x, status: normalizeStatus(x.status) }));
 
     const nextCursor = r.has_more ? r.next_cursor : null;
 
-    // 6) Antwort (+etwas Debug bei Bedarf)
+    // 6) Antwort (+ Debug optional)
     res.json({
       results,
       nextCursor,
       hasMore: !!r.has_more,
-      debug: (req.query.debug ? {
-        ownerTried: ['OwnerID','Owner ID','Artist', 'OwnerID(rollup)','Owner ID(rollup)'],
-        statusType: getProp(r.results?.[0], 'Status')?.type || null,
-        summaryType: getProp(r.results?.[0], 'Summary')?.type || null
-      } : undefined)
+      debug: debug ? {
+        ownerPropsFound: ownerOr.map(o => o.property),
+        summaryType: getProp(r.results?.[0], 'Summary')?.type || null,
+        statusType:  getProp(r.results?.[0], 'Status')?.type || null
+      } : undefined
     });
 
   } catch (e) {
-    // WICHTIG: gib den echten Notion-Body zurück
     const details = e?.body || e?.message || String(e);
     console.error('@events error:', details);
     res.status(500).json({ error: 'Server error', details });
