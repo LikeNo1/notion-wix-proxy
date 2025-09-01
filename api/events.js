@@ -3,8 +3,8 @@ import { Client } from '@notionhq/client';
 
 // === ENV ===
 const notion  = new Client({ auth: process.env.NOTION_TOKEN });
-const DB_BOOK = process.env.BOOKING_DB_ID;
-const DB_ART  = process.env.ARTISTS_DB_ID;
+const DB_BOOK = process.env.BOOKING_DB_ID;  // Booking Process
+const DB_ART  = process.env.ARTISTS_DB_ID;  // Artists
 
 // ---- CORS / Helpers -------------------------------------------------
 function cors(res, req) {
@@ -21,6 +21,7 @@ function bad(res, msg, details) { return res.status(400).json({ error: msg, deta
 function plain(rich) { return Array.isArray(rich) ? rich.map(n => n?.plain_text || '').join('').trim() : ''; }
 function getProp(page, key) { return page?.properties?.[key]; }
 
+// Summary/Texts robust auslesen (Formula/Rollup/Title/RichText)
 function extractTextFromProp(prop) {
   if (!prop || !prop.type) return '';
   switch (prop.type) {
@@ -33,24 +34,30 @@ function extractTextFromProp(prop) {
       if (f.type === 'date')    return f.date?.start || '';
       return '';
     }
-    case 'rich_text': return plain(prop.rich_text);
-    case 'title':     return plain(prop.title);
     case 'rollup': {
       const r = prop.rollup;
       if (!r) return '';
-      if (r.type === 'array') return (r.array || []).map(x => extractTextFromProp(x)).filter(Boolean).join(' ').trim();
+      if (r.type === 'array') {
+        return (r.array || [])
+          .map(x => extractTextFromProp(x))
+          .filter(Boolean)
+          .join(' ')
+          .trim();
+      }
       if (r.type === 'number') return (typeof r.number === 'number') ? String(r.number) : '';
       if (r.type === 'date')   return r.date?.start || '';
       return '';
     }
-    default: return '';
+    case 'title':     return plain(prop.title);
+    case 'rich_text': return plain(prop.rich_text);
+    default:          return '';
   }
 }
 
 function mapBookingPage(page) {
   const pGig   = getProp(page, 'Gig');
   const pStat  = getProp(page, 'Status');
-  const pSum   = getProp(page, 'Summary');              // Summary direkt (Formula/Rollup/Text)
+  const pSum   = getProp(page, 'Summary');              // Summary direkt aus Booking (auch wenn Formel/Rollup)
   const pAvail = getProp(page, 'Artist availability');
   const pComm  = getProp(page, 'Artist comment');
 
@@ -82,33 +89,7 @@ function normalizeStatus(s = '') {
   return str;
 }
 
-// --- Baue je Property beide möglichen Filter ---
-function buildRelationFilter(property, artistId) {
-  return { property, relation: { contains: artistId } };
-}
-function buildRollupFilter(property, artistId) {
-  return { property, rollup: { any: { relation: { contains: artistId } } } };
-}
-
-// Testet per 1-Item-Query, ob ein Filter in deiner DB gültig ist
-async function isFilterValid(databaseId, filterObj) {
-  try {
-    await notion.databases.query({
-      database_id: databaseId,
-      page_size: 1,
-      filter: filterObj
-    });
-    return true;
-  } catch (e) {
-    // nur echte Schema-/Typfehler ausschließen
-    const code = e?.body?.code || e?.code || '';
-    const msg  = e?.body?.message || e?.message || '';
-    if (code === 'validation_error' || /does not match/.test(msg)) return false;
-    // andere Fehler (Rate limit etc.) lassen wir durchgehen
-    return true;
-  }
-}
-
+// ---- Handler --------------------------------------------------------
 export default async function handler(req, res) {
   cors(res, req);
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -133,7 +114,7 @@ export default async function handler(req, res) {
 
     if (!musicianId) return bad(res, 'Missing musicianId');
 
-    // 1) Artist finden
+    // 1) Artist finden (in Artists-DB anhand Wix-ID in Textfeld)
     const idFilters = [
       { property: 'WixOwnerID',    rich_text: { equals: String(musicianId) } },
       { property: 'Wix Owner ID',  rich_text: { equals: String(musicianId) } },
@@ -151,44 +132,23 @@ export default async function handler(req, res) {
     if (!artistPage) {
       return res.status(404).json({
         error: 'Artist not found by Wix member id',
-        hint: 'Prüfe ARTISTS_DB_ID und stelle sicher, dass die Wix-ID exakt in einem Textfeld steht.',
+        hint: 'Prüfe ARTISTS_DB_ID und dass die Wix-ID exakt in einem Textfeld steht.',
         musicianId,
         artistsQueryError
       });
     }
 
+    // 2) Booking: nur über Relation "Artist" filtern (kein Rollup!)
     const artistId = artistPage.id;
-
-    // 2) Gültige Owner-Filter vorab „probieren“
-    const ownerCandidates = ['Artist', 'OwnerID', 'Owner ID'];
-    const ownerOr = [];
-    for (const propName of ownerCandidates) {
-      // Relation-Probe
-      const relSingle = buildRelationFilter(propName, artistId);
-      const relValid  = await isFilterValid(DB_BOOK, relSingle);
-      if (relValid) {
-        ownerOr.push(relSingle);
-        continue; // Relation funktioniert – Rollup-Variante unnötig
+    const andFilters = [
+      { property: 'Artist', relation: { contains: artistId } }, // <— Harter Filter auf Relation "Artist"
+      {
+        or: [
+          { property: 'Status', status: { does_not_equal: 'Potential' } },
+          { property: 'Status', select: { does_not_equal: 'Potential' } }
+        ]
       }
-      // Rollup-Probe
-      const rollSingle = buildRollupFilter(propName, artistId);
-      const rollValid  = await isFilterValid(DB_BOOK, rollSingle);
-      if (rollValid) ownerOr.push(rollSingle);
-    }
-
-    if (!ownerOr.length) {
-      return bad(res, 'No usable owner filter in Booking DB', { tried: ownerCandidates });
-    }
-
-    const andFilters = [{ or: ownerOr }];
-
-    // "Potential" strikt ausschließen
-    andFilters.push({
-      or: [
-        { property: 'Status', status: { does_not_equal: 'Potential' } },
-        { property: 'Status', select: { does_not_equal: 'Potential' } }
-      ]
-    });
+    ];
 
     // Optional: Status-Filter
     const statusNorm = String(status || '').trim();
@@ -239,8 +199,9 @@ export default async function handler(req, res) {
       hasMore: !!r.has_more,
       debug: debug ? {
         artistId,
-        ownerFiltersUsed: ownerOr,
-        pageSize: size
+        usingOwnerProperty: 'Artist (relation only)',
+        statusType: getProp(r.results?.[0], 'Status')?.type || null,
+        summaryType: getProp(r.results?.[0], 'Summary')?.type || null
       } : undefined
     });
 
