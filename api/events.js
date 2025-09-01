@@ -142,6 +142,7 @@ function composeSummaryFromEvent(evtPage) {
   // liest direkt die Event-Felder (egal ob select/rich_text/rollup/whatever)
   const date      = readAny(evtPage, ["Date + Time", "Date", "Datetime", "Date/Time"]);
   const country   = readAny(evtPage, ["Country"]);
+  const state     = readAny(evtPage, ["Bundesland (nur D)"]);
   const location  = readAny(evtPage, ["Location", "City"]);
   const website   = readAny(evtPage, ["Website", "Web", "URL"]);
   const instagram = readAny(evtPage, ["Instagram", "IG"]);
@@ -151,7 +152,7 @@ function composeSummaryFromEvent(evtPage) {
 
   const lines = [];
   lines.push(`📅 Datum/Zeit: ${date || "noch zu terminieren"}`);
-  lines.push(`🗺️ Location: ${[country, location].filter(Boolean).join("/") || "/"}`);
+  lines.push(`🗺️ Location: ${[country, state, location].filter(Boolean).join("/") || "/"}`);
   {
     const links = [website, instagram, facebook].filter(Boolean).join(" ").trim();
     lines.push(`🔗 Link: ${links}`);
