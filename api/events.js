@@ -152,7 +152,7 @@ function composeSummaryFromEvent(evtPage) {
 
   const lines = [];
   lines.push(`📅 Datum/Zeit: ${date || "noch zu terminieren"}`);
-  lines.push(`🗺️ Location: ${[country, statde, location].filter(Boolean).join("/") || "/"}`);
+  lines.push(`🗺️ Location: ${[country, statede, location].filter(Boolean).join("/") || "/"}`);
   {
     const links = [website, instagram, facebook].filter(Boolean).join(" ").trim();
     lines.push(`🔗 Link: ${links}`);
