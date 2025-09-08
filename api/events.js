@@ -143,7 +143,7 @@ async function getPage(id) {
 function composeSummaryFromEvent(evtPage) {
   const date      = readAny(evtPage, ["Date + Time", "Date", "Datetime", "Date/Time"]);
   const country   = readAny(evtPage, ["Country"]);
-  const statede   = readAny(evtPage, ["Bundesland (nur DE)", "Bundesland", "State"]);
+  const statede   = readAny(evtPage, ["Bundesland (nur D)", "Bundesland", "State"]);
   const location  = readAny(evtPage, ["Location", "City"]);
   const website   = readAny(evtPage, ["Website", "Web", "URL"]);
   const instagram = readAny(evtPage, ["Instagram", "IG"]);
