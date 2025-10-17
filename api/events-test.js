@@ -123,3 +123,109 @@ export default async function handler(req, res) {
     const {
       musicianId = "",
       cursor = null,
+      q = "",
+      sort = "gig_asc",
+      status = "all"
+    } = req.query || {};
+    if (!musicianId) return bad(res, "Missing musicianId");
+
+    // 1) Artist
+    const artist = await findArtistByWixId(musicianId);
+    if (!artist) return res.status(404).json({ error: "Artist not found by Wix member id", musicianId });
+
+    // 2) DB Info (cached)
+    const info = await getBookingInfoCached();
+    if (!info.ownerName || !info.ownerType)
+      return bad(res, "Owner relation/rollup not found in Booking DB", info);
+
+    // 3) Filter
+    const ownerFilter =
+      info.ownerType === "relation"
+        ? { property: info.ownerName, relation: { contains: artist.id } }
+        : { property: info.ownerName, rollup: { any: { relation: { contains: artist.id } } } };
+
+    const andFilters = [];
+    if (info.statusProp.name) {
+      if (info.statusProp.type === "status") {
+        andFilters.push({ property: "Status", status: { does_not_equal: "Potential" } });
+        andFilters.push({ property: "Status", status: { does_not_equal: "Archiv" } });
+      } else if (info.statusProp.type === "select") {
+        andFilters.push({ property: "Status", select: { does_not_equal: "Potential" } });
+        andFilters.push({ property: "Status", select: { does_not_equal: "Archiv" } });
+      }
+    }
+
+    const statusNorm = String(status).trim();
+    if (info.statusProp.name && statusNorm && statusNorm.toLowerCase() !== "all") {
+      if (info.statusProp.type === "status")
+        andFilters.push({ property: "Status", status: { equals: statusNorm } });
+      else if (info.statusProp.type === "select")
+        andFilters.push({ property: "Status", select: { equals: statusNorm } });
+    }
+    if (q) andFilters.push({ property: "Gig", title: { contains: String(q) } });
+
+    const sorts =
+      sort === "gig_desc" ? [{ property: "Gig", direction: "descending" }] :
+      sort === "gig_asc"  ? [{ property: "Gig", direction: "ascending"  }] :
+                            [{ timestamp: "last_edited_time", direction: "descending" }];
+
+    // 4) Query Booking (keine per-Event Aufrufe!)
+    const params = {
+      database_id: DB_BOOK,
+      page_size: 50,
+      sorts,
+      filter: { and: [ownerFilter, ...andFilters] }
+    };
+    if (cursor) params.start_cursor = String(cursor);
+
+    const r = await notion.databases.query(params);
+
+    // 5) Mapping – Summary aus Rollup / Summary-Property, Datum Fixed -> Individual
+    const results = [];
+    for (const page of (r.results || [])) {
+      const gigProp    = P(page, "Gig");
+      const statusProp = P(page, "Status");
+      const availProp  = P(page, "Artist availability") || P(page, "Availability artist");
+      const commProp   = P(page, "Artist comment");
+
+      const summaryRollup = P(page, "WixSummary") || P(page, "Booking Process Rollup") || P(page, "Summary");
+      const dateFixed     = P(page, "Date + Time (fixed event)");
+      const dateIndiv     = P(page, "Date + Time (individual concert)");
+
+      const gig =
+        gigProp?.type === "title" ? plain(gigProp.title) :
+        gigProp?.type === "rich_text" ? plain(gigProp.rich_text) : "";
+
+      const statusTxt =
+        statusProp?.type === "status" ? (statusProp.status?.name || "") :
+        statusProp?.type === "select" ? (statusProp.select?.name || "") : "";
+
+      const availabilityTxt = textFrom(availProp);
+      const comment =
+        commProp?.type === "rich_text" ? plain(commProp.rich_text) :
+        commProp?.type === "title" ? plain(commProp.title) : "";
+
+      const summary = textFrom(summaryRollup) || "";
+      const displayDate = textFrom(dateFixed) || textFrom(dateIndiv) || "";
+
+      results.push({
+        id: page.id,
+        gig,
+        summary,
+        displayDate,
+        status: statusTxt,
+        availability: availabilityTxt,
+        comment,
+        _summaryVia: "rollup"
+      });
+    }
+
+    res.json({
+      results,
+      nextCursor: r.has_more ? r.next_cursor : null,
+      hasMore: !!r.has_more
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Server error", details: e.body || e.message || String(e) });
+  }
+}
