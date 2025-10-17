@@ -1,20 +1,16 @@
 // /api/events-test.js
 import { Client } from "@notionhq/client";
 
-/**
- * Notion Client (neue Version wie von Notion gefordert)
- */
+// ---------- Notion Client ----------
 const notion = new Client({
   auth: process.env.NOTION_TOKEN,
   notionVersion: process.env.NOTION_VERSION || "2025-09-03",
 });
 
-const DB_BOOK = process.env.BOOKING_DB_ID;   // Booking / Stages DB
-const DB_ART  = process.env.ARTISTS_DB_ID;   // Artists DB (nur noch Fallback)
+const DB_BOOK = process.env.BOOKING_DB_ID;
+const DB_ART  = process.env.ARTISTS_DB_ID; // optional (nur Fallback)
 
-/**
- * CORS
- */
+// ---------- CORS ----------
 function setCors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -27,9 +23,7 @@ function setCors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
 }
 
-/**
- * Helpers
- */
+// ---------- Helpers ----------
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
 
@@ -65,50 +59,33 @@ function textFrom(prop) {
   }
 }
 
-/**
- * (Fallback) Artist anhand WixOwnerID in Artists-DB suchen
- * – bleibt als Rückfallebene erhalten, falls Booking-DB kein WixOwnerID-Feld hätte
- */
+// (Optionale) Artists-Fallbacksuche – nur falls wir in der Booking-DB gar nicht auf WixOwnerID filtern können
 async function findArtistByWixId(musicianId) {
   const id = String(musicianId || "").trim();
   if (!id || !DB_ART) return null;
   const props = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
 
-  // equals
   for (const p of props) {
     try {
-      const r = await notion.databases.query({
-        database_id: DB_ART,
-        page_size: 1,
-        filter: { property: p, rich_text: { equals: id } }
-      });
-      if (r.results?.length) return r.results[0];
+      const eq = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: { property: p, rich_text: { equals: id } }});
+      if (eq.results?.length) return eq.results[0];
     } catch {}
   }
-  // contains
   for (const p of props) {
     try {
-      const r = await notion.databases.query({
-        database_id: DB_ART,
-        page_size: 1,
-        filter: { property: p, rich_text: { contains: id } }
-      });
-      if (r.results?.length) return r.results[0];
+      const ct = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: { property: p, rich_text: { contains: id } }});
+      if (ct.results?.length) return ct.results[0];
     } catch {}
   }
   return null;
 }
 
-/**
- * Booking-DB Struktur
- */
+// Booking-DB lesen
 async function getBookingInfo() {
   const db = await notion.databases.retrieve({ database_id: DB_BOOK });
-
-  // Status-Property (status/select)
   const statusProp = db.properties?.["Status"] ? { name: "Status", type: db.properties["Status"].type } : null;
 
-  // Owner-Prop (Relation/Rollup) – optional, nur für Fallback
+  // Owner-Kandidaten (Relation/Rollup) – nur für Fallback
   let ownerName = null, ownerType = null;
   for (const [name, def] of Object.entries(db.properties || {})) {
     if ((/owner|artist/i).test(name) && (def.type === "relation" || def.type === "rollup")) {
@@ -121,43 +98,46 @@ async function getBookingInfo() {
     }
   }
 
-  // WICHTIG: direktes Feld "WixOwnerID" in der Booking-DB (Name exakt so)
-  const wixOwnerDef = db.properties?.["WixOwnerID"] || null; // kann rich_text / formula / rollup / title sein
+  // Wichtig: das Feld "WixOwnerID" (egal welcher Typ)
+  const wixOwnerDef = db.properties?.["WixOwnerID"] || null;
 
   return { db, statusProp, ownerName, ownerType, wixOwnerDef };
 }
 
-/**
- * Filter-Bausteine je nach Typ der Booking-DB-Property "WixOwnerID"
- */
-function buildDirectIdFilter(wixOwnerDef, id) {
-  if (!wixOwnerDef) return null;
+// —— Kern: Filter-Detektion ——
+// Wir probieren mehrere gültige Filtervarianten auf "WixOwnerID" aus,
+// die erste erfolgreiche (keine 400/validation error) wird benutzt.
+async function detectIdFilter(id) {
+  const candidates = [
+    { property: "WixOwnerID", title:      { contains: id } },
+    { property: "WixOwnerID", rich_text:  { contains: id } },
+    { property: "WixOwnerID", select:     { equals:   id } },
+    { property: "WixOwnerID", status:     { equals:   id } },
+    { property: "WixOwnerID", formula:    { string: { contains: id } } },
+    { property: "WixOwnerID", rollup:     { any: { rich_text: { contains: id } } } },
+    // zusätzliche Versuche für exotische Rollups (string)
+    { property: "WixOwnerID", rollup:     { any: { title:     { contains: id } } } },
+    { property: "WixOwnerID", rollup:     { any: { formula:   { string: { contains: id } } } } }
+  ];
 
-  // Wir versuchen möglichst breit gefächert, aber typ-korrekt zu filtern:
-  switch (wixOwnerDef.type) {
-    case "title":
-      return { property: "WixOwnerID", title: { contains: id } };
-    case "rich_text":
-      return { property: "WixOwnerID", rich_text: { contains: id } };
-    case "select":
-      return { property: "WixOwnerID", select: { equals: id } };
-    case "status":
-      return { property: "WixOwnerID", status: { equals: id } };
-    case "formula":
-      // Notion unterstützt Filter auf formula.string
-      return { property: "WixOwnerID", formula: { string: { contains: id } } };
-    case "rollup":
-      // Rollup kann Array/String sein – wir versuchen es über "any.rich_text.contains"
-      return { property: "WixOwnerID", rollup: { any: { rich_text: { contains: id } } } };
-    default:
-      // fallback (eher generisch, Notion wird ungültige Typen ablehnen – aber harmlose Rückfallebene)
-      return { property: "WixOwnerID", rich_text: { contains: id } };
+  for (const cand of candidates) {
+    try {
+      const r = await notion.databases.query({
+        database_id: DB_BOOK,
+        page_size: 1,
+        filter: cand
+      });
+      // Wenn Notion keinen Typfehler wirft, akzeptieren wir diese Filterform
+      return cand;
+    } catch (e) {
+      // invalid filter → weiterprobieren
+      continue;
+    }
   }
+  return null;
 }
 
-/**
- * Handler
- */
+// ---------- Handler ----------
 export default async function handler(req, res) {
   setCors(res, req);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -177,16 +157,17 @@ export default async function handler(req, res) {
     const id = String(musicianId || "").trim();
     if (!id) return res.status(400).json({ error: "Missing musicianId" });
 
-    // Booking-DB lesen
-    const { db, statusProp, ownerName, ownerType, wixOwnerDef } = await getBookingInfo();
+    const { statusProp, ownerName, ownerType, wixOwnerDef } = await getBookingInfo();
 
-    // --- Primär: direkt in Booking-DB auf "WixOwnerID" filtern ---
+    // 1) Primär: Versuche, in Booking-DB direkt auf "WixOwnerID" zu filtern (egal welcher Typ)
+    let idFilter = null;
+    if (wixOwnerDef) {
+      idFilter = await detectIdFilter(id);
+    }
+
+    // 2) Fallback: Artist in Artists-DB suchen und über Owner-Relation filtern
     let ownerFilter = null;
-    const directFilter = buildDirectIdFilter(wixOwnerDef, id);
-
-    // --- Fallback: wenn kein direktes WixOwnerID-Feld vorhanden oder Filter nicht möglich,
-    // dann Artist via Artists-DB suchen und per Relation/Rollup filtern (wie früher)
-    if (!directFilter && ownerName && ownerType && DB_ART) {
+    if (!idFilter && ownerName && ownerType && DB_ART) {
       const artist = await findArtistByWixId(id);
       if (artist) {
         ownerFilter =
@@ -196,32 +177,28 @@ export default async function handler(req, res) {
       }
     }
 
-    if (!directFilter && !ownerFilter) {
+    if (!idFilter && !ownerFilter) {
       return res.status(404).json({
         error: "Neither direct WixOwnerID filter nor owner-relation fallback available.",
         musicianId: id,
-        hint: "Ensure Booking DB has a 'WixOwnerID' property (text/rollup/formula/title) OR share Artists DB with integration."
+        hint: "Check: Booking DB has 'WixOwnerID' and integration permissions; or share Artists DB with the integration."
       });
     }
 
-    // --- HIDE: Potential/Archiv/Archive ausblenden ---
-    const HIDE = ["Potential", "Archiv", "Archive"];
+    // Status-Hiding & optionale Filter
     const andFilters = [];
+    const HIDE = ["Potential","Archiv","Archive"];
     if (statusProp?.type === "status") HIDE.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
     else if (statusProp?.type === "select") HIDE.forEach(v => andFilters.push({ property: "Status", select: { does_not_equal: v } }));
 
-    // optional: Status (sichtbare)
     const statusNorm = String(status).trim();
     if (statusNorm) {
       if (statusProp?.type === "status") andFilters.push({ property: "Status", status: { equals: statusNorm } });
       else if (statusProp?.type === "select") andFilters.push({ property: "Status", select: { equals: statusNorm } });
     }
-
-    // optional: Suche im Titel
     if (q) andFilters.push({ property: "Gig", title: { contains: String(q) } });
 
-    // finaler Filter
-    const baseFilter = directFilter ? directFilter : ownerFilter;
+    const baseFilter = idFilter ? idFilter : ownerFilter;
     const filter = { and: [baseFilter, ...andFilters] };
 
     const params = {
@@ -234,7 +211,7 @@ export default async function handler(req, res) {
 
     const r = await notion.databases.query(params);
 
-    // Mapping Notion → Frontend
+    // Mapping
     const results = [];
     for (const page of (r.results || [])) {
       const gig         = textFrom(P(page, "Gig"));
@@ -250,8 +227,7 @@ export default async function handler(req, res) {
 
       results.push({
         id: page.id,
-        gig,
-        summary,
+        gig, summary,
         status: statusTxt,
         availability,
         comment,
@@ -264,7 +240,7 @@ export default async function handler(req, res) {
       results,
       nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more,
-      _via: directFilter ? "booking.wixownerid" : "owner.relation.fallback"
+      _via: idFilter ? "booking.wixownerid.detected" : "owner.relation.fallback"
     });
   } catch (e) {
     res.status(500).json({ error: "Server error", details: e.body || e.message || String(e) });
