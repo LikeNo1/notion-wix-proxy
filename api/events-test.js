@@ -1,6 +1,12 @@
 // /api/events-test.js
 import { Client } from "@notionhq/client";
 
+// HIER die Version ergänzen:
+const notion = new Client({
+  auth: process.env.NOTION_TOKEN,
+  notionVersion: "2025-09-03"
+});
+
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 const DB_ART  = process.env.ARTISTS_DB_ID;
