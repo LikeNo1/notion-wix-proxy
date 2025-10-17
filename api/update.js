@@ -1,3 +1,4 @@
+// /api/update.js
 import { Client } from '@notionhq/client';
 
 const notion = new Client({
@@ -6,8 +7,7 @@ const notion = new Client({
 });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 
-// ---------- CORS ----------
-function cors(res, req) {
+function setCors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
   const origin = req.headers.origin || "";
@@ -15,17 +15,16 @@ function cors(res, req) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
     res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
 }
-
 function bad(res, status, msg, details) {
   return res.status(status).json({ error: msg, details });
 }
 
 export default async function handler(req, res) {
-  cors(res, req);
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  setCors(res, req);
+  if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return bad(res, 405, 'Method not allowed');
 
   if (!process.env.NOTION_TOKEN || !DB_BOOK) {
@@ -61,7 +60,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Optional: nach Absenden Status setzen (nur wenn Property existiert)
     if (pStat) {
       const target = 'Sent to LikeNo1';
       if (pStat.type === 'status') props['Status'] = { status: { name: target } };
@@ -76,23 +74,17 @@ export default async function handler(req, res) {
       });
     }
 
-    try {
-      await notion.pages.update({ page_id: bookingId, properties: props });
-    } catch (err) {
-      const body = err?.body || {};
-      const msg = body?.message || err?.message || String(err);
-      if (msg?.toLowerCase().includes('does not exist') || msg?.toLowerCase().includes('status')) {
-        return bad(res, 400, 'Notion lehnt das Status-Update ab. Prüfe, ob in "Status" die Option "Sent to LikeNo1" existiert.', { notionError: body || msg });
-      }
-      if (msg?.toLowerCase().includes('select')) {
-        return bad(res, 400, 'Notion lehnt Artist availability ab. Prüfe, ob die Select-Optionen "Yes", "No", "Other" existieren.', { notionError: body || msg });
-      }
-      return bad(res, 400, 'Notion update failed', { notionError: body || msg });
-    }
-
+    await notion.pages.update({ page_id: bookingId, properties: props });
     res.json({ ok: true });
   } catch (e) {
-    console.error('@update error:', e?.body || e?.message || e);
-    return bad(res, 500, 'Server error', e?.body || e?.message || String(e));
+    const body = e?.body || {};
+    const msg = body?.message || e?.message || String(e);
+    if (msg?.toLowerCase().includes('does not exist') || msg?.toLowerCase().includes('status')) {
+      return bad(res, 400, 'Notion lehnt das Status-Update ab. Prüfe, ob in "Status" die Option "Sent to LikeNo1" existiert.', { notionError: body || msg });
+    }
+    if (msg?.toLowerCase().includes('select')) {
+      return bad(res, 400, 'Notion lehnt Artist availability ab. Prüfe, ob die Select-Optionen "Yes", "No", "Other" existieren.', { notionError: body || msg });
+    }
+    return bad(res, 400, 'Notion update failed', { notionError: body || msg });
   }
 }
