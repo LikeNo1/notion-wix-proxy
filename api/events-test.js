@@ -1,23 +1,26 @@
-// /api/events.js
+// /api/events-test.js
 import { Client } from "@notionhq/client";
+
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DB_BOOK = process.env.BOOKING_DB_ID;
 const DB_ART  = process.env.ARTISTS_DB_ID;
 
+// Helpers
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
 function textFrom(prop) {
   if (!prop) return "";
   switch (prop.type) {
-    case "title": return plain(prop.title);
-    case "rich_text": return plain(prop.rich_text);
-    case "url": return prop.url || "";
-    case "number": return (prop.number ?? "") + "";
-    case "status": return prop.status?.name || "";
-    case "select": return prop.select?.name || "";
+    case "title":        return plain(prop.title);
+    case "rich_text":    return plain(prop.rich_text);
+    case "url":          return prop.url || "";
+    case "number":       return (prop.number ?? "") + "";
+    case "status":       return prop.status?.name || "";
+    case "select":       return prop.select?.name || "";
     case "multi_select": return (prop.multi_select || []).map(o => o.name).join(", ");
-    case "date": return prop.date?.start || "";
-    case "formula": { const f = prop.formula || {};
+    case "date":         return prop.date?.start || "";
+    case "formula": {
+      const f = prop.formula || {};
       if (f.type === "string") return f.string || "";
       if (f.type === "number") return (f.number ?? "") + "";
       if (f.type === "boolean")return f.boolean ? "true" : "false";
@@ -26,7 +29,7 @@ function textFrom(prop) {
     }
     case "rollup": {
       const r = prop.rollup || {};
-      if (r.type === "array") return (r.array || []).map(v => textFrom(v)).filter(Boolean).join(" ").trim();
+      if (r.type === "array")  return (r.array || []).map(v => textFrom(v)).filter(Boolean).join(" ").trim();
       if (r.type === "number") return (r.number ?? "") + "";
       if (r.type === "date")   return r.date?.start || "";
       if (r.type === "string") return r.string || "";
@@ -42,7 +45,7 @@ async function findArtistByWixId(musicianId) {
   for (const p of names) {
     for (const variant of [
       { rich_text: { equals: id } }, { rich_text: { contains: id } },
-      { title: { equals: id } }, { title: { contains: id } },
+      { title: { equals: id } },     { title: { contains: id } },
       { formula: { string: { equals: id } } }, { formula: { string: { contains: id } } }
     ]) {
       try {
@@ -54,10 +57,21 @@ async function findArtistByWixId(musicianId) {
   return null;
 }
 
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+// CORS
+function cors(res, req) {
+  const allowed = (process.env.ALLOWED_ORIGINS || "*")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const origin = req.headers.origin || "";
+  if (!allowed.length || allowed.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+}
+
+export default async function handler(req, res) {
+  cors(res, req);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
@@ -84,29 +98,29 @@ export default async function handler(req, res) {
         if (def.type === "relation" || def.type === "rollup") { ownerName = name; ownerType = def.type; break; }
       }
     }
+
     const statusProp = db.properties?.["Status"];
     const ownerFilter =
       ownerType === "relation"
         ? { property: ownerName, relation: { contains: artist.id } }
         : { property: ownerName, rollup: { any: { relation: { contains: artist.id } } } };
 
+    // Basierend auf Status: Potential/Archiv serverseitig ausschließen
     const andFilters = [];
-    // Archiv & Potential ausschließen
+    const hideVals = ["Potential","Archiv","Archive"];
     if (statusProp?.type === "status") {
-      andFilters.push({ property: "Status", status: { does_not_equal: "Potential" } });
-      andFilters.push({ property: "Status", status: { does_not_equal: "Archiv" } });
-      andFilters.push({ property: "Status", status: { does_not_equal: "Archive" } });
+      hideVals.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
     } else if (statusProp?.type === "select") {
-      andFilters.push({ property: "Status", select: { does_not_equal: "Potential" } });
-      andFilters.push({ property: "Status", select: { does_not_equal: "Archiv" } });
-      andFilters.push({ property: "Status", select: { does_not_equal: "Archive" } });
+      hideVals.forEach(v => andFilters.push({ property: "Status", select: { does_not_equal: v } }));
     }
 
+    // Optionaler Status-Filter
     const statusNorm = String(status).trim();
     if (statusNorm) {
       if (statusProp?.type === "status") andFilters.push({ property: "Status", status: { equals: statusNorm } });
       else if (statusProp?.type === "select") andFilters.push({ property: "Status", select: { equals: statusNorm } });
     }
+
     if (q) andFilters.push({ property: "Gig", title: { contains: String(q) } });
 
     const params = {
@@ -125,17 +139,29 @@ export default async function handler(req, res) {
       const statusP    = P(page, "Status");
       const availProp  = P(page, "Artist availability") || P(page, "Availability artist");
       const commProp   = P(page, "Artist comment");
+      const joyProp    = P(page, "Joy comment");         // <— NEU
+      const summaryRU  = P(page, "WixSummary") || P(page, "Summary");
 
       const gig = textFrom(gigProp);
       const statusTxt =
         statusP?.type === "status" ? (statusP.status?.name || "") :
         statusP?.type === "select" ? (statusP.select?.name || "") : "";
 
-      const summary = textFrom(P(page, "WixSummary")) || textFrom(P(page, "Summary")) || "";
       const availabilityTxt = textFrom(availProp);
       const comment = textFrom(commProp);
+      const joyComment = textFrom(joyProp);
+      const summary = textFrom(summaryRU);
 
-      results.push({ id: page.id, gig, summary, status: statusTxt, availability: availabilityTxt, comment, _summaryVia: "rollup" });
+      results.push({
+        id: page.id,
+        gig,
+        summary,
+        status: statusTxt,
+        availability: availabilityTxt,
+        comment,
+        joyComment,            // <— für #commentjoy
+        _summaryVia: "rollup"
+      });
     }
 
     res.json({ results, nextCursor: r.has_more ? r.next_cursor : null, hasMore: !!r.has_more });
