@@ -63,7 +63,7 @@ function textFrom(prop) {
 async function findArtistByWixId(musicianId) {
   const id = String(musicianId || "").trim();
   if (!id || !DB_ART) return null;
-  const props = ["WixOwnerID", "Wix Owner ID", "Wix Member ID"];
+  const props = ["WixOwnerID"];
 
   for (const p of props) {
     try {
