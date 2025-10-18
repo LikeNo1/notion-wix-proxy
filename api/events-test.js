@@ -1,17 +1,15 @@
 // /api/events-test.js
 import { Client } from "@notionhq/client";
 
-/** Notion Client (mit neuer Version) */
-const notion = new Client({
-  auth: process.env.NOTION_TOKEN,
-  notionVersion: process.env.NOTION_VERSION || "2025-09-03",
-});
+// --- Helpers: ID normalisieren (nur Hex, dann UUID-Format) ---
+function normalizeId(id) {
+  const hex = String(id || "").trim().replace(/[^a-f0-9]/gi, "");
+  if (hex.length < 32) return null;
+  const core = hex.slice(0, 32).toLowerCase();
+  return `${core.slice(0,8)}-${core.slice(8,12)}-${core.slice(12,16)}-${core.slice(16,20)}-${core.slice(20)}`;
+}
 
-const DB_BOOK = process.env.BOOKING_DB_ID; // Booking / Stages
-const DB_ART  = process.env.ARTISTS_DB_ID; // Artists (nur für Relation-Filter, falls genutzt)
-
-/** CORS */
-function setCors(res, req) {
+function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
   const origin = req.headers.origin || "";
@@ -23,12 +21,20 @@ function setCors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
 }
 
-/** Helpers */
+const notion = new Client({
+  auth: process.env.NOTION_TOKEN,
+  notionVersion: process.env.NOTION_VERSION || "2025-09-03",
+});
+
+const RAW_BOOK = process.env.BOOKING_DB_ID;
+const RAW_ART  = process.env.ARTISTS_DB_ID;
+
+const DB_BOOK = normalizeId(RAW_BOOK);
+const DB_ART  = RAW_ART ? normalizeId(RAW_ART) : null;
+
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
 
-// Einheitskonverter: macht aus (fast) allen Notion-Property-Typen einen String.
-// -> Wichtig: Rollups werden zu lesbarem Text zusammengezogen (wie bei Summary).
 function textFrom(prop) {
   if (!prop) return "";
   switch (prop.type) {
@@ -53,165 +59,93 @@ function textFrom(prop) {
     }
     case "rollup": {
       const r = prop.rollup || {};
-      if (r.type === "array" && Array.isArray(r.array)) {
-        // Elemente können wiederum Properties sein – rekursiv formatieren
-        return r.array.map(v => textFrom(v)).filter(Boolean).join(" ").trim();
-      }
+      if (r.type === "array")  return (r.array || []).map(v => textFrom(v)).filter(Boolean).join(" ").trim();
       if (r.type === "number") return (r.number ?? "") + "";
       if (r.type === "date")   return r.date?.start || "";
       if (r.type === "string") return r.string || "";
       return "";
     }
-    default:
-      return "";
+    default: return "";
   }
 }
 
-/** (optional) Artist-Lookup – falls du weiterhin per Owner-Relation filtern willst */
-async function findArtistByWixIdFlexible(musicianId) {
-  const id = String(musicianId || "").trim();
-  if (!id || !DB_ART) return null;
-  // sehr tolerante Suche über bekannte Feldnamen/Typen
-  const names = ["WixOwnerID","Wix Owner ID","Wix Member ID"];
-  for (const name of names) {
-    // rich_text / title / formula.string / rollup.any.rich_text
-    const filters = [
-      { property: name, rich_text: { equals: id } },
-      { property: name, rich_text: { contains: id } },
-      { property: name, title:     { equals: id } },
-      { property: name, title:     { contains: id } },
-      { property: name, formula:   { string: { equals: id } } },
-      { property: name, formula:   { string: { contains: id } } },
-      { property: name, rollup:    { any: { rich_text: { contains: id } } } },
-    ];
-    for (const f of filters) {
-      try {
-        const r = await notion.databases.query({ database_id: DB_ART, page_size: 1, filter: f });
-        if (r.results?.length) return r.results[0];
-      } catch { /* next */ }
-    }
+async function getBookingInfoStrict() {
+  // explizit prüfen, um „invalid_request_url“ früh abzufangen
+  if (!process.env.NOTION_TOKEN) {
+    const e = new Error("NOTION_TOKEN missing"); e.status = 400; throw e;
   }
-  return null;
-}
-
-/** Booking-DB: Status + Owner (für Relation-Fallback) */
-async function getBookingInfo() {
-  const db = await notion.databases.retrieve({ database_id: DB_BOOK });
-
-  // Status-Property (status/select)
-  const statusProp = db.properties?.["Status"]
-    ? { name: "Status", type: db.properties["Status"].type }
-    : null;
-
-  // Owner (Relation/Rollup) – nur falls du über Artists-Relation filtern willst
-  let ownerName = null, ownerType = null;
-  for (const [name, def] of Object.entries(db.properties || {})) {
-    if ((/owner|artist/i).test(name) && (def.type === "relation" || def.type === "rollup")) {
-      ownerName = name; ownerType = def.type; break;
-    }
+  if (!RAW_BOOK) {
+    const e = new Error("BOOKING_DB_ID missing"); e.status = 400; throw e;
   }
-  if (!ownerName) {
-    for (const [name, def] of Object.entries(db.properties || {})) {
-      if (def.type === "relation" || def.type === "rollup") { ownerName = name; ownerType = def.type; break; }
-    }
-  }
-
-  return { db, statusProp, ownerName, ownerType };
-}
-
-/** Handler */
-export default async function handler(req, res) {
-  setCors(res, req);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
-
-  if (!process.env.NOTION_TOKEN || !DB_BOOK) {
-    return res.status(400).json({
-      error: "Missing envs",
-      haveToken: !!process.env.NOTION_TOKEN,
-      haveBook: !!DB_BOOK,
-      haveArt: !!DB_ART
-    });
+  if (!DB_BOOK) {
+    const e = new Error(`BOOKING_DB_ID invalid format: "${RAW_BOOK}". Copy ONLY the database ID (32 hex) or hyphenated UUID.`);
+    e.status = 400; throw e;
   }
 
   try {
-    // Wir lassen Query-Parameter wie gehabt zu (musicianId, q, status, cursor),
-    // aber der Fokus hier: Rollups als Text zurückgeben.
-    const { musicianId = "", cursor = null, q = "", status = "" } = req.query || {};
-    const id = String(musicianId || "").trim();
+    const db = await notion.databases.retrieve({ database_id: DB_BOOK });
+    const statusProp = db.properties?.["Status"]
+      ? { name: "Status", type: db.properties["Status"].type }
+      : null;
 
-    const { statusProp, ownerName, ownerType } = await getBookingInfo();
+    // evtl. Owner für spätere Erweiterungen
+    let ownerName = null, ownerType = null;
+    for (const [name, def] of Object.entries(db.properties || {})) {
+      if ((/owner|artist/i).test(name) && (def.type === "relation" || def.type === "rollup")) {
+        ownerName = name; ownerType = def.type; break;
+      }
+    }
+    return { statusProp, ownerName, ownerType };
+  } catch (err) {
+    const e = new Error(`Cannot retrieve BOOKING_DB (check share/permissions & ID). Notion said: ${err?.body?.message || err?.message}`);
+    e.status = 400; throw e;
+  }
+}
 
-    // --- Filter aufsetzen ---
-    const andFilters = [];
+export default async function handler(req, res) {
+  cors(res, req);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
-    // Archiv/Potential ausblenden
+  try {
+    const { cursor = null, q = "", status = "" } = req.query || {};
+    const { statusProp } = await getBookingInfoStrict();
+
     const HIDE = ["Potential","Archiv","Archive"];
+    const andFilters = [];
     if (statusProp?.type === "status") HIDE.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
     else if (statusProp?.type === "select") HIDE.forEach(v => andFilters.push({ property: "Status", select: { does_not_equal: v } }));
 
-    // optional sichtbarer Status
-    const statusNorm = String(status).trim();
-    if (statusNorm) {
-      if (statusProp?.type === "status") andFilters.push({ property: "Status", status: { equals: statusNorm } });
-      else if (statusProp?.type === "select") andFilters.push({ property: "Status", select: { equals: statusNorm } });
+    const sNorm = String(status || "").trim();
+    if (sNorm) {
+      if (statusProp?.type === "status") andFilters.push({ property: "Status", status: { equals: sNorm } });
+      else if (statusProp?.type === "select") andFilters.push({ property: "Status", select: { equals: sNorm } });
     }
-
-    // optional Suche im Titel
     if (q) andFilters.push({ property: "Gig", title: { contains: String(q) } });
-
-    // Falls du weiter über Artist-Relation einschränken willst:
-    // (Wenn nicht nötig: ownerFilter einfach weglassen, dann bekommst du alle Einträge)
-    let ownerFilter = null;
-    if (id && DB_ART && ownerName && ownerType) {
-      const artist = await findArtistByWixIdFlexible(id);
-      if (artist) {
-        ownerFilter =
-          ownerType === "relation"
-            ? { property: ownerName, relation: { contains: artist.id } }
-            : { property: ownerName, rollup: { any: { relation: { contains: artist.id } } } };
-      }
-    }
-
-    const filter = ownerFilter ? { and: [ownerFilter, ...andFilters] } : (andFilters.length ? { and: andFilters } : undefined);
 
     const params = {
       database_id: DB_BOOK,
       page_size: 50,
-      sorts: [{ timestamp: "last_edited_time", direction: "descending" }]
+      sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
+      ...(andFilters.length ? { filter: { and: andFilters } } : {})
     };
-    if (filter) params.filter = filter;
     if (cursor) params.start_cursor = String(cursor);
 
     const r = await notion.databases.query(params);
 
-    // Mapping → WICHTIG: Rollups als Text!
     const results = (r.results || []).map(page => {
       const gig         = textFrom(P(page, "Gig"));
       const statusP     = P(page, "Status");
       const statusTxt   =
         statusP?.type === "status" ? (statusP.status?.name || "") :
         statusP?.type === "select" ? (statusP.select?.name || "") : "";
-
       const availability = textFrom(P(page, "Artist availability")) || textFrom(P(page, "Availability artist"));
       const comment      = textFrom(P(page, "Artist comment"));
       const joyComment   = textFrom(P(page, "Joy comment"));
-
-      // 👉 Rollups als Text (wie bei Summary):
       const summary      = textFrom(P(page, "WixSummary")) || textFrom(P(page, "Summary"));
-      const wixOwnerId   = textFrom(P(page, "WixOwnerID")); // <-- DEIN ROLLUP/FORMULA/TEXT → jetzt sauber zu String
+      const wixOwnerId   = textFrom(P(page, "WixOwnerID"));
 
-      return {
-        id: page.id,
-        gig,
-        summary,
-        wixOwnerId,              // <- kann im Frontend angezeigt werden
-        status: statusTxt,
-        availability,
-        comment,
-        joyComment,
-        _summaryVia: "rollup"
-      };
+      return { id: page.id, gig, summary, wixOwnerId, status: statusTxt, availability, comment, joyComment };
     });
 
     res.status(200).json({
@@ -220,6 +154,10 @@ export default async function handler(req, res) {
       hasMore: !!r.has_more
     });
   } catch (e) {
-    res.status(500).json({ error: "Server error", details: e.body || e.message || String(e) });
+    const status = e.status || 500;
+    res.status(status).json({
+      error: status === 500 ? "Server error" : "Bad request",
+      hint: e.message,
+    });
   }
 }
