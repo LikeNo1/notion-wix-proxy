@@ -1,7 +1,7 @@
 // /api/events-test.js
 import { Client } from "@notionhq/client";
 
-// --- ID normalisieren ---
+/* ---------- ID normalizer (safe for copied URLs) ---------- */
 function normalizeId(id) {
   const hex = String(id || "").trim().replace(/[^a-f0-9]/gi, "");
   if (hex.length < 32) return null;
@@ -9,7 +9,7 @@ function normalizeId(id) {
   return `${core.slice(0,8)}-${core.slice(8,12)}-${core.slice(12,16)}-${core.slice(16,20)}-${core.slice(20)}`;
 }
 
-// --- CORS ---
+/* ---------- CORS ---------- */
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -22,17 +22,17 @@ function cors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
 }
 
-// ⚠️ Version hier HART setzen, unabhängig von ENV:
-const NOTION_VER = "2025-09-03";
-
+/* ---------- Notion Client (version only if valid YYYY-MM-DD) ---------- */
+const versionEnv = String(process.env.NOTION_VERSION || "").trim();
+const looksLikeDate = /^\d{4}-\d{2}-\d{2}$/.test(versionEnv);
 const notion = new Client({
   auth: process.env.NOTION_TOKEN,
-  notionVersion: NOTION_VER,
+  ...(looksLikeDate ? { notionVersion: versionEnv } : {})
 });
 
 const DB_BOOK = normalizeId(process.env.BOOKING_DB_ID);
 
-// --- Notion Helfer ---
+/* ---------- Notion helpers ---------- */
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
 function textFrom(prop) {
@@ -69,7 +69,7 @@ function textFrom(prop) {
   }
 }
 
-// --- DB-Schema (Status) ---
+/* ---------- DB schema (Status) ---------- */
 async function getBookingInfoStrict() {
   if (!process.env.NOTION_TOKEN) { const e = new Error("NOTION_TOKEN missing"); e.status = 400; throw e; }
   if (!DB_BOOK) { const e = new Error("BOOKING_DB_ID invalid or missing"); e.status = 400; throw e; }
@@ -89,7 +89,7 @@ async function getBookingInfoStrict() {
   return { statusProp };
 }
 
-// --- Handler ---
+/* ---------- Handler ---------- */
 export default async function handler(req, res) {
   cors(res, req);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -123,12 +123,13 @@ export default async function handler(req, res) {
     try {
       r = await notion.databases.query(params);
     } catch (err) {
-      // Klarere Diagnose
       return res.status(400).json({
         error: "Bad request",
         step: "databases.query",
         details: err?.body?.message || err?.message || String(err),
-        hint: `Notion-Version=${NOTION_VER}`
+        hint: looksLikeDate
+          ? `NOTION_VERSION=${versionEnv}`
+          : "No explicit NOTION_VERSION passed (SDK default). If error persists, set NOTION_VERSION=2022-06-28"
       });
     }
 
