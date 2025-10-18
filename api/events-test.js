@@ -22,9 +22,12 @@ function cors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
 }
 
+// ⚠️ Version hier HART setzen, unabhängig von ENV:
+const NOTION_VER = "2025-09-03";
+
 const notion = new Client({
   auth: process.env.NOTION_TOKEN,
-  notionVersion: process.env.NOTION_VERSION || "2025-09-03",
+  notionVersion: NOTION_VER,
 });
 
 const DB_BOOK = normalizeId(process.env.BOOKING_DB_ID);
@@ -69,14 +72,20 @@ function textFrom(prop) {
 // --- DB-Schema (Status) ---
 async function getBookingInfoStrict() {
   if (!process.env.NOTION_TOKEN) { const e = new Error("NOTION_TOKEN missing"); e.status = 400; throw e; }
-  if (!DB_BOOK) {
-    const e = new Error("BOOKING_DB_ID invalid or missing. Copy only the 32-char ID or UUID.");
+  if (!DB_BOOK) { const e = new Error("BOOKING_DB_ID invalid or missing"); e.status = 400; throw e; }
+
+  let db;
+  try {
+    db = await notion.databases.retrieve({ database_id: DB_BOOK });
+  } catch (err) {
+    const e = new Error(`retrieve_failed: ${err?.body?.message || err?.message}`);
     e.status = 400; throw e;
   }
-  const db = await notion.databases.retrieve({ database_id: DB_BOOK });
+
   const statusProp = db.properties?.["Status"]
     ? { name: "Status", type: db.properties["Status"].type }
     : null;
+
   return { statusProp };
 }
 
@@ -90,7 +99,6 @@ export default async function handler(req, res) {
     const { cursor = null, q = "", status = "" } = req.query || {};
     const { statusProp } = await getBookingInfoStrict();
 
-    // Basis-Filter: Archive/Potential ausblenden + optionale Suche/Status
     const HIDE = ["Potential","Archiv","Archive"];
     const andFilters = [];
     if (statusProp?.type === "status") HIDE.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
@@ -111,7 +119,18 @@ export default async function handler(req, res) {
     };
     if (cursor) params.start_cursor = String(cursor);
 
-    const r = await notion.databases.query(params);
+    let r;
+    try {
+      r = await notion.databases.query(params);
+    } catch (err) {
+      // Klarere Diagnose
+      return res.status(400).json({
+        error: "Bad request",
+        step: "databases.query",
+        details: err?.body?.message || err?.message || String(err),
+        hint: `Notion-Version=${NOTION_VER}`
+      });
+    }
 
     const results = (r.results || []).map(page => {
       const gig         = textFrom(P(page, "Gig"));
@@ -119,13 +138,11 @@ export default async function handler(req, res) {
       const statusTxt   =
         statusP?.type === "status" ? (statusP.status?.name || "") :
         statusP?.type === "select" ? (statusP.select?.name || "") : "";
-
       const availability = textFrom(P(page, "Artist availability")) || textFrom(P(page, "Availability artist"));
       const comment      = textFrom(P(page, "Artist comment"));
       const joyComment   = textFrom(P(page, "Joy comment"));
       const summary      = textFrom(P(page, "WixSummary")) || textFrom(P(page, "Summary"));
-      const wixOwnerId   = textFrom(P(page, "WixOwnerID")); // Rollup/Formula/Text → sauberer String
-
+      const wixOwnerId   = textFrom(P(page, "WixOwnerID"));
       return { id: page.id, gig, summary, wixOwnerId, status: statusTxt, availability, comment, joyComment };
     });
 
