@@ -71,30 +71,63 @@ function textFrom(prop) {
   }
 }
 
-/* ---------- DB-Schema lesen (mit ID-Fallback) ---------- */
+/* ---------- Booking-DB lesen + WixOwnerID-Feld finden ---------- */
 async function retrieveDbWithFallback(rawId) {
   const dashed = toDashed(rawId);
   const raw32  = toRaw32(rawId);
   if (!raw32) {
     const e = new Error("BOOKING_DB_ID invalid or missing"); e.status = 400; throw e;
   }
-
-  // 1) Try dashed first
   try {
     const db = await notion.databases.retrieve({ database_id: dashed || raw32 });
     return { db, whichId: dashed ? "dashed" : "raw32", idUsed: (dashed || raw32) };
-  } catch (e1) {
-    // 2) Then try raw32
-    try {
-      const db = await notion.databases.retrieve({ database_id: raw32 });
-      return { db, whichId: "raw32", idUsed: raw32 };
-    } catch (e2) {
-      const msg = e2?.body?.message || e2?.message || String(e2);
-      const err = new Error(`retrieve_failed: ${msg}`);
-      err.status = 400;
-      throw err;
-    }
+  } catch {
+    // fallback auf raw32
+    const db = await notion.databases.retrieve({ database_id: raw32 });
+    return { db, whichId: "raw32", idUsed: raw32 };
   }
+}
+
+/** Finde die Property in der Booking-DB, die "WixOwnerID" entspricht (case-insensitive, Varianten erlaubt) */
+function findWixOwnerIdProp(db) {
+  if (!db?.properties) return null;
+  const props = db.properties;
+  // Kandidatennamen (deine Notion schreibt "WixOwnerID")
+  const candidates = Object.keys(props).filter(name =>
+    /wix\s*owner\s*id|wixownerid|wix\s*member\s*id/i.test(name)
+  );
+  if (candidates.length) {
+    const name = candidates[0];
+    return { name, type: props[name].type };
+  }
+  // harter Fallback: explizite Namen testen
+  for (const name of ["WixOwnerID","Wix Owner ID","Wix Member ID"]) {
+    if (props[name]) return { name, type: props[name].type };
+  }
+  return null;
+}
+
+/** Baue OR-Filter für WixOwnerID je nach Property-Typ (rich_text/title/formula/rollup) */
+function buildWixOwnerFilters(propName, musicianId) {
+  const id = String(musicianId || "").trim();
+  if (!id) return null;
+  // Wir probieren equals *und* contains (falls Formatierungen/Whitespace anders sind)
+  return {
+    or: [
+      { property: propName, rich_text: { equals: id } },
+      { property: propName, rich_text: { contains: id } },
+      { property: propName, title:     { equals: id } },
+      { property: propName, title:     { contains: id } },
+      { property: propName, formula:   { string: { equals: id } } },
+      { property: propName, formula:   { string: { contains: id } } },
+      { property: propName, rollup:    { any: { rich_text: { equals: id } } } },
+      { property: propName, rollup:    { any: { rich_text: { contains: id } } } },
+      { property: propName, rollup:    { any: { title:     { equals: id } } } },
+      { property: propName, rollup:    { any: { title:     { contains: id } } } },
+      { property: propName, rollup:    { any: { formula:   { string: { equals: id } } } } },
+      { property: propName, rollup:    { any: { formula:   { string: { contains: id } } } } }
+    ]
+  };
 }
 
 function buildBaseFilters(statusProp, q, status) {
@@ -112,30 +145,19 @@ function buildBaseFilters(statusProp, q, status) {
   return andFilters;
 }
 
-/* ---------- Query mit Fallback (dashed → raw32) ---------- */
+/* ---------- Query mit (dasched/raw32)-Fallback ---------- */
 async function queryWithFallback(dbIdRaw, paramsCore) {
   const dashed = toDashed(dbIdRaw);
   const raw32  = toRaw32(dbIdRaw);
-
-  // 1) Try dashed via SDK
   try {
     const r = await notion.databases.query({ database_id: dashed || raw32, ...paramsCore });
     return { r, whichId: dashed ? "dashed" : "raw32", idUsed: (dashed || raw32) };
   } catch (e1) {
-    const details = e1?.body?.message || e1?.message || String(e1);
-    if (!/invalid request url/i.test(details)) {
-      // anderer Fehler → direkt weiterreichen
-      const err = new Error(details); err.step = "databases.query (sdk)"; throw err;
-    }
-    // 2) If "Invalid request URL.", try raw32 explicitly
-    try {
-      const r = await notion.databases.query({ database_id: raw32, ...paramsCore });
-      return { r, whichId: "raw32", idUsed: raw32 };
-    } catch (e2) {
-      const err = new Error(e2?.body?.message || e2?.message || String(e2));
-      err.step = "databases.query (fallback raw32)";
-      throw err;
-    }
+    // bei "Invalid request URL." -> raw32 versuchen
+    const msg = e1?.body?.message || e1?.message || String(e1);
+    if (!/invalid request url/i.test(msg)) throw e1;
+    const r = await notion.databases.query({ database_id: raw32, ...paramsCore });
+    return { r, whichId: "raw32", idUsed: raw32 };
   }
 }
 
@@ -148,16 +170,24 @@ export default async function handler(req, res) {
   if (!process.env.BOOKING_DB_ID) return res.status(400).json({ error: "Bad request", details: "BOOKING_DB_ID missing" });
 
   try {
-    const { cursor = null, q = "", status = "" } = req.query || {};
+    const { cursor = null, q = "", status = "", musicianId = "" } = req.query || {};
 
-    // 1) retrieve (und Status-Property bestimmen)
+    // 1) Booking-DB + Schema
     const { db, whichId: retrievedAs, idUsed } = await retrieveDbWithFallback(process.env.BOOKING_DB_ID);
     const statusProp = db.properties?.["Status"]
       ? { name: "Status", type: db.properties["Status"].type }
       : null;
 
-    // 2) Filter + Params bauen
+    // 2) Basis-Filter (Archive/Potential ausblenden + optional Status/Suche)
     const andFilters = buildBaseFilters(statusProp, q, status);
+
+    // 3) WixOwnerID in Booking-DB finden + OR-Filter auf musicianId anwenden
+    const wixOwner = findWixOwnerIdProp(db);
+    if (musicianId && wixOwner?.name) {
+      const ownerOr = buildWixOwnerFilters(wixOwner.name, musicianId);
+      if (ownerOr) andFilters.unshift(ownerOr); // ganz nach vorne (zusätzlich zu Basis-Filtern)
+    }
+
     const paramsCore = {
       page_size: 50,
       sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
@@ -165,10 +195,10 @@ export default async function handler(req, res) {
     };
     if (cursor) paramsCore.start_cursor = String(cursor);
 
-    // 3) query mit Fallback
+    // 4) Query (mit ID-Fallback)
     const { r, whichId: queriedAs, idUsed: qId } = await queryWithFallback(process.env.BOOKING_DB_ID, paramsCore);
 
-    // 4) Mapping
+    // 5) Mapping
     const results = (r.results || []).map(page => {
       const gig         = textFrom(P(page, "Gig"));
       const statusP     = P(page, "Status");
@@ -188,7 +218,13 @@ export default async function handler(req, res) {
       results,
       nextCursor: r.has_more ? r.next_cursor : null,
       hasMore: !!r.has_more,
-      _debug: { retrievedAs, queriedAs, retrieveId: idUsed, queryId: qId, notionVersionUsed: looksLikeDate ? versionEnv : "sdk-default" }
+      _debug: {
+        retrievedAs, queriedAs,
+        retrieveId: idUsed, queryId: qId,
+        usedOwnerProp: wixOwner?.name || null,
+        notionVersionUsed: looksLikeDate ? versionEnv : "sdk-default",
+        filteredByMusicianId: !!(musicianId && wixOwner?.name)
+      }
     });
   } catch (e) {
     res.status(400).json({
