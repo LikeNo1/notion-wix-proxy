@@ -1,7 +1,7 @@
 // /api/events-test.js
 import { Client } from "@notionhq/client";
 
-// --- Helpers: ID normalisieren (nur Hex, dann UUID-Format) ---
+// --- ID normalisieren ---
 function normalizeId(id) {
   const hex = String(id || "").trim().replace(/[^a-f0-9]/gi, "");
   if (hex.length < 32) return null;
@@ -9,6 +9,7 @@ function normalizeId(id) {
   return `${core.slice(0,8)}-${core.slice(8,12)}-${core.slice(12,16)}-${core.slice(16,20)}-${core.slice(20)}`;
 }
 
+// --- CORS ---
 function cors(res, req) {
   const allowed = (process.env.ALLOWED_ORIGINS || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -26,15 +27,11 @@ const notion = new Client({
   notionVersion: process.env.NOTION_VERSION || "2025-09-03",
 });
 
-const RAW_BOOK = process.env.BOOKING_DB_ID;
-const RAW_ART  = process.env.ARTISTS_DB_ID;
+const DB_BOOK = normalizeId(process.env.BOOKING_DB_ID);
 
-const DB_BOOK = normalizeId(RAW_BOOK);
-const DB_ART  = RAW_ART ? normalizeId(RAW_ART) : null;
-
+// --- Notion Helfer ---
 const P = (page, key) => page?.properties?.[key] ?? null;
 const plain = a => Array.isArray(a) ? a.map(n => n?.plain_text || "").join("").trim() : "";
-
 function textFrom(prop) {
   if (!prop) return "";
   switch (prop.type) {
@@ -69,39 +66,21 @@ function textFrom(prop) {
   }
 }
 
+// --- DB-Schema (Status) ---
 async function getBookingInfoStrict() {
-  // explizit prüfen, um „invalid_request_url“ früh abzufangen
-  if (!process.env.NOTION_TOKEN) {
-    const e = new Error("NOTION_TOKEN missing"); e.status = 400; throw e;
-  }
-  if (!RAW_BOOK) {
-    const e = new Error("BOOKING_DB_ID missing"); e.status = 400; throw e;
-  }
+  if (!process.env.NOTION_TOKEN) { const e = new Error("NOTION_TOKEN missing"); e.status = 400; throw e; }
   if (!DB_BOOK) {
-    const e = new Error(`BOOKING_DB_ID invalid format: "${RAW_BOOK}". Copy ONLY the database ID (32 hex) or hyphenated UUID.`);
+    const e = new Error("BOOKING_DB_ID invalid or missing. Copy only the 32-char ID or UUID.");
     e.status = 400; throw e;
   }
-
-  try {
-    const db = await notion.databases.retrieve({ database_id: DB_BOOK });
-    const statusProp = db.properties?.["Status"]
-      ? { name: "Status", type: db.properties["Status"].type }
-      : null;
-
-    // evtl. Owner für spätere Erweiterungen
-    let ownerName = null, ownerType = null;
-    for (const [name, def] of Object.entries(db.properties || {})) {
-      if ((/owner|artist/i).test(name) && (def.type === "relation" || def.type === "rollup")) {
-        ownerName = name; ownerType = def.type; break;
-      }
-    }
-    return { statusProp, ownerName, ownerType };
-  } catch (err) {
-    const e = new Error(`Cannot retrieve BOOKING_DB (check share/permissions & ID). Notion said: ${err?.body?.message || err?.message}`);
-    e.status = 400; throw e;
-  }
+  const db = await notion.databases.retrieve({ database_id: DB_BOOK });
+  const statusProp = db.properties?.["Status"]
+    ? { name: "Status", type: db.properties["Status"].type }
+    : null;
+  return { statusProp };
 }
 
+// --- Handler ---
 export default async function handler(req, res) {
   cors(res, req);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -111,6 +90,7 @@ export default async function handler(req, res) {
     const { cursor = null, q = "", status = "" } = req.query || {};
     const { statusProp } = await getBookingInfoStrict();
 
+    // Basis-Filter: Archive/Potential ausblenden + optionale Suche/Status
     const HIDE = ["Potential","Archiv","Archive"];
     const andFilters = [];
     if (statusProp?.type === "status") HIDE.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
@@ -139,11 +119,12 @@ export default async function handler(req, res) {
       const statusTxt   =
         statusP?.type === "status" ? (statusP.status?.name || "") :
         statusP?.type === "select" ? (statusP.select?.name || "") : "";
+
       const availability = textFrom(P(page, "Artist availability")) || textFrom(P(page, "Availability artist"));
       const comment      = textFrom(P(page, "Artist comment"));
       const joyComment   = textFrom(P(page, "Joy comment"));
       const summary      = textFrom(P(page, "WixSummary")) || textFrom(P(page, "Summary"));
-      const wixOwnerId   = textFrom(P(page, "WixOwnerID"));
+      const wixOwnerId   = textFrom(P(page, "WixOwnerID")); // Rollup/Formula/Text → sauberer String
 
       return { id: page.id, gig, summary, wixOwnerId, status: statusTxt, availability, comment, joyComment };
     });
@@ -154,10 +135,6 @@ export default async function handler(req, res) {
       hasMore: !!r.has_more
     });
   } catch (e) {
-    const status = e.status || 500;
-    res.status(status).json({
-      error: status === 500 ? "Server error" : "Bad request",
-      hint: e.message,
-    });
+    res.status(e.status || 500).json({ error: e.status ? "Bad request" : "Server error", details: e.message });
   }
 }
