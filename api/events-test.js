@@ -157,7 +157,7 @@ function findOwnerPropInBooking(db) {
 
 /* ---------- Basis-Filter (Archiv/Potential weg + optional Status/Suche) ---------- */
 function buildBaseFilters(statusProp, q, status) {
-  const HIDE = ["Potential","Archiv","Archive"];
+  const HIDE = ["Potential","Archive"];
   const andFilters = [];
   if (statusProp?.type === "status") HIDE.forEach(v => andFilters.push({ property: "Status", status: { does_not_equal: v } }));
   else if (statusProp?.type === "select") HIDE.forEach(v => andFilters.push({ property: "Status", select: { does_not_equal: v } }));
